@@ -89,7 +89,7 @@ An update replaces the engine, launcher, `defaults.json` and the shipped `phases
 | `/sl-feature <file>` | Load a spec in [feature mode](#feature-mode) (one commit per planned step). Also clears `run/`. |
 | `/sl-go` | Start, or resume after pause/stall. |
 | `/sl-pause` | Stop driving the session; keep the phase. |
-| `/sl-status` | Show the state (phase, iteration, history). |
+| `/sl-status` | Show the state: the raw state JSON in single mode, a step summary in feature mode. |
 | `/sl-advance` | Force-pass the current phase. |
 | `/sl-reset` | Delete the state and the `run/` artifacts. |
 
@@ -226,6 +226,23 @@ If the commit fails (for example a pre-commit hook rejects it), the step goes ba
 
 **Completion.** After the last step, the run is `done` and the final message lists every step as `<short sha> <title>` (or `(empty)`) with the branch name. Review the branch and open a pull request yourself: specloop never pushes, and `/sl-reset` never deletes the branch or its commits.
 
+**Git guard rails.** While a feature run is `active` (planning or a step), PreToolUse denies Bash commands that contain any entry of `feature.blockedCommands` (default: `git commit`, `git checkout`, `git switch`, `git reset`, `git rebase`, `git merge`, `git stash`, `git branch -D`, `git push`), because the engine owns the branch and the commits. Matching is by substring, like `blockedCommandsUntilDone`, which still applies in both modes. Single mode is not affected. `/sl-pause` lifts the guard if you need to run one of these yourself.
+
+**Steps file protection.** On every Stop during a step, before the phase check runs, the engine compares `run/steps.json` with its approved copy (`approvedSteps` in state). Changing a `done` or `empty` step, any step's `status` or `commit`, removing or reordering finished steps, or adding a non-pending step blocks the stop with the errors and keeps the phase; a missing or unparsable file is blocked too. Other edits (for example a pending step's description) pass the check but are not adopted: only the engine updates `approvedSteps`, and it rewrites `run/steps.json` from it at the next commit. Planning and plan approval are not affected: any `steps.json` that passes validation at approval becomes `approvedSteps`.
+
+**Context and status.** In feature mode the context header shows progress, for example `[specloop] feature step 3/7 "Add schema validation", phase=review, iteration 2, branch=specloop/big-feature`, or `[specloop] feature planning, phase=feature-plan, iteration 1, branch=…` while planning. `/sl-status` prints a summary instead of raw JSON:
+
+```
+[specloop] feature run, status=active
+spec: specs/big-feature.md
+branch: specloop/big-feature (base 1a2b3c4)
+phase: review, iteration 2
+steps (1/3 done):
+  1  done     5d6e7f8  Add schema validation
+  2  active   -        Wire the check
+  3  pending  -        Document it
+```
+
 The single-mode size warnings do not apply in feature mode.
 
 | Key | Default | Meaning |
@@ -240,6 +257,7 @@ The single-mode size warnings do not apply in feature mode.
 | `feature.commitExclude` | `[".claude/specloop/"]` | Paths never included in step commits. |
 | `feature.commitMessage` | `"{type}: {step_title}\n\nspecloop step {step_index}/{step_count} ({step_id}) of {spec}"` | Commit message template; `{type}` is the step's `type` (default `feat`). |
 | `feature.pauseBetweenSteps` | `false` | Pause after each step's commit. |
+| `feature.blockedCommands` | `git commit`, `checkout`, `switch`, `reset`, `rebase`, `merge`, `stash`, `branch -D`, `push` | Bash commands denied while a feature run is active. |
 
 ## Tips
 

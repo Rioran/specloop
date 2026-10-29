@@ -41,7 +41,9 @@
     },
     "commitExclude": [".claude/specloop/"],
     "commitMessage": "{type}: {step_title}\n\nspecloop step {step_index}/{step_count} ({step_id}) of {spec}",
-    "pauseBetweenSteps": false
+    "pauseBetweenSteps": false,
+    "blockedCommands": ["git commit", "git checkout", "git switch", "git reset", "git rebase", "git merge",
+                        "git stash", "git branch -D", "git push"]
   },
   "phases": {
     "plan": {

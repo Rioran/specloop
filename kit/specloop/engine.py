@@ -236,8 +236,14 @@ def clear_failure(root):
 
 
 def header(state):
-    return "[specloop] phase=%s, iteration %d, spec=%s" % (
-        state["phase"], state.get("iter", 0), state.get("spec", "?"))
+    if not is_feature(state):
+        return "[specloop] phase=%s, iteration %d, spec=%s" % (
+            state["phase"], state.get("iter", 0), state.get("spec", "?"))
+    index, step = current_step(state) if in_step(state) else (None, None)
+    where = ('feature step %d/%d "%s"' % (index + 1, len(state["approvedSteps"]["steps"]), step["title"])
+             if step is not None else "feature planning")
+    return "[specloop] %s, phase=%s, iteration %d, branch=%s" % (
+        where, state["phase"], state.get("iter", 0), state.get("branch") or "-")
 
 
 def relative_to_project(root, path):
@@ -589,6 +595,24 @@ def approve_plan(root, config, state):
     return None
 
 
+def steps_file_violation(root, state):
+    """Compare run/steps.json with approvedSteps during a step. Return the failure details, or None."""
+    rel = _rel("run", "steps.json")
+    restore = ("Restore it from approvedSteps in %s; only specloop changes step status, commits and finished "
+               "steps." % _rel("state.json"))
+    try:
+        with open(os.path.join(run_dir(root), "steps.json"), encoding="utf-8") as f:
+            current = json.load(f)
+    except FileNotFoundError:
+        return "%s is missing. %s" % (rel, restore)
+    except ValueError as e:
+        return "%s is not valid JSON (%s). %s" % (rel, e, restore)
+    errors = check_steps_immutable(state.get("approvedSteps") or {}, current)
+    if not errors:
+        return None
+    return "%s may only be changed by specloop: %s\n%s\n\n%s" % (rel, errors[0], "\n".join(errors[1:]), restore)
+
+
 def save_steps(root, state):
     """Write approvedSteps (including engine-owned status/commit changes) back to run/steps.json."""
     with open(os.path.join(run_dir(root), "steps.json"), "w", encoding="utf-8") as f:
@@ -722,7 +746,11 @@ def handle_stop(root, hook_input):
     config = load_config(root)
     phase = state["phase"]
     graph = phase_graph(config, state)
-    result, details, full = check_phase(root, config, graph[phase])
+    violation = steps_file_violation(root, state) if in_step(state) else None
+    if violation:
+        result, details, full = "fail", head(violation, config.get("maxOutputChars", 4000)), violation
+    else:
+        result, details, full = check_phase(root, config, graph[phase])
     state["iter"] = state.get("iter", 0) + 1
     state.setdefault("history", []).append(
         {"phase": phase, "result": result, "at": now(), "iter": state["iter"]})
@@ -856,6 +884,12 @@ def handle_pretool(root, hook_input):
         for blocked in config.get("blockedCommandsUntilDone", []):
             if blocked in command:
                 return deny("'%s' is not allowed until the workflow is done (phase '%s')." % (blocked, phase))
+        if is_feature(state):
+            for blocked in config["feature"].get("blockedCommands", []):
+                if blocked in command:
+                    return deny("'%s' is not allowed while a feature run is active: specloop owns the feature "
+                                "branch %s and makes the step commits itself. Run %s first if the user wants to "
+                                "do this by hand." % (blocked, state.get("branch", "-"), cmd_name(config, "pause")))
     return None
 
 
@@ -981,7 +1015,37 @@ def cmd_advance(root):
 
 def cmd_status(root):
     state = load_state(root)
-    return json.dumps(state, indent=2) if state else "No workflow state."
+    if not state:
+        return "No workflow state."
+    return feature_status(root, state) if is_feature(state) else json.dumps(state, indent=2)
+
+
+def feature_status(root, state):
+    """Readable summary of a feature run: branch, phase and one line per step."""
+    lines = ["[specloop] feature run, status=%s" % state.get("status"), "spec: %s" % state.get("spec")]
+    if state.get("branch"):
+        lines.append("branch: %s (base %s)" % (state["branch"], (state.get("baseRef") or "")[:7]))
+    else:
+        lines.append("branch: - (created by the first go)")
+    lines.append("phase: %s, iteration %d" % (state.get("phase"), state.get("iter", 0)))
+    steps, note = (state.get("approvedSteps") or {}).get("steps"), ""
+    if steps is None:
+        try:
+            with open(os.path.join(run_dir(root), "steps.json"), encoding="utf-8") as f:
+                steps, note = json.load(f)["steps"], "not approved yet, "
+            steps = [s for s in steps if isinstance(s, dict)]
+        except (OSError, ValueError, KeyError, TypeError):
+            lines.append("steps: no plan yet")
+            return "\n".join(lines)
+    done = sum(1 for s in steps if s.get("status") in LOCKED_STATUSES)
+    lines.append("steps (%s%d/%d done):" % (note, done, len(steps)))
+    rows = [(str(s.get("id", "?")), str(s.get("status", "?")), (s.get("commit") or "-")[:7], str(s.get("title", "")))
+            for s in steps]
+    width_id = max([len(r[0]) for r in rows] or [0])
+    width_status = max([len(r[1]) for r in rows] or [0])
+    for step_id, status, sha, title in rows:
+        lines.append("  %s  %s  %-7s  %s" % (step_id.rjust(width_id), status.ljust(width_status), sha, title))
+    return "\n".join(lines)
 
 
 def cmd_reset(root):
