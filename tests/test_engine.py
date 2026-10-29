@@ -363,6 +363,271 @@ class EngineTest(unittest.TestCase):
         workflow.cmd_init(self.root, "missing.md")
         self.assertTrue(os.path.exists(os.path.join(self.base, "run", "plan.md")))
 
+    # --- steps check type ----------------------------------------------------------
+
+    def use_steps_check(self, require_all_pending=True, **extra):
+        check = {"type": "steps", "path": ".claude/specloop/run/steps.json"}
+        if require_all_pending is not None:
+            check["requireAllPending"] = require_all_pending
+        config = {"phases": {"plan": {"check": check}, "implement": {"check": None}}}
+        config.update(extra)
+        self.set_config(config)
+        self.start()
+
+    def test_steps_check_passes_and_enters_next_phase(self):
+        self.use_steps_check()
+        self.write_run("steps.json", json.dumps(valid_steps()))
+        out = workflow.handle_stop(self.root, {})
+        self.assertEqual("block", out["decision"])
+        self.assertIn("entering phase 'implement'", out["reason"])
+
+    def test_steps_check_fails_when_missing(self):
+        self.use_steps_check()
+        out = workflow.handle_stop(self.root, {})
+        self.assertIn("steps.json", out["reason"])
+        self.assertIn("missing", out["reason"])
+        self.assertEqual("plan", self.state()["phase"])
+
+    def test_steps_check_fails_on_invalid_json(self):
+        self.use_steps_check()
+        self.write_run("steps.json", "{not json")
+        out = workflow.handle_stop(self.root, {})
+        self.assertIn("not valid JSON", out["reason"])
+        self.assertEqual("plan", self.state()["phase"])
+
+    def test_steps_check_fails_on_schema_errors_and_lists_all(self):
+        self.use_steps_check()
+        data = valid_steps()
+        data["feature"] = ""
+        data["steps"][1]["title"] = ""
+        self.write_run("steps.json", json.dumps(data))
+        out = workflow.handle_stop(self.root, {})
+        self.assertIn("feature", out["reason"])
+        self.assertIn("steps[1] (id 2): title", out["reason"])
+        self.assertEqual("plan", self.state()["phase"])
+
+    def test_steps_check_require_all_pending(self):
+        data = valid_steps()
+        data["steps"][0]["status"] = "done"
+        self.use_steps_check()
+        self.write_run("steps.json", json.dumps(data))
+        out = workflow.handle_stop(self.root, {})
+        self.assertIn("steps[0] (id 1): status", out["reason"])
+        self.assertIn("pending", out["reason"])
+        self.assertEqual("plan", self.state()["phase"])
+
+        self.use_steps_check(require_all_pending=False)
+        self.write_run("steps.json", json.dumps(data))
+        self.assertIn("entering phase 'implement'", workflow.handle_stop(self.root, {})["reason"])
+
+    def test_steps_check_require_all_pending_defaults_to_false(self):
+        data = valid_steps()
+        data["steps"][0]["status"] = "done"
+        self.use_steps_check(require_all_pending=None)
+        self.write_run("steps.json", json.dumps(data))
+        self.assertIn("entering phase 'implement'", workflow.handle_stop(self.root, {})["reason"])
+
+    def test_steps_check_details_truncated(self):
+        self.use_steps_check(maxOutputChars=100)
+        data = {"feature": "F", "steps": [{"id": i + 1} for i in range(20)]}
+        self.write_run("steps.json", json.dumps(data))
+        out = workflow.handle_stop(self.root, {})
+        self.assertIn("...(truncated)", out["reason"])
+        self.assertIn("steps[0] (id 1)", out["reason"])
+        self.assertNotIn("steps[19]", out["reason"])
+
+
+def valid_steps():
+    return {
+        "feature": "Short feature title",
+        "steps": [
+            {
+                "id": 1,
+                "title": "Add steps.json schema validation",
+                "type": "feat",
+                "description": "What to change and why.",
+                "acceptance": ["Observable criteria this step must satisfy"],
+                "files": ["kit/specloop/engine.py"],
+                "status": "pending",
+                "commit": None,
+            },
+            {
+                "id": 2,
+                "title": "Document it",
+                "description": "Explain the format.",
+                "acceptance": ["README mentions steps.json"],
+                "status": "pending",
+            },
+        ],
+    }
+
+
+class StepsValidationTest(unittest.TestCase):
+
+    def errors_for(self, index, field, value, delete=False):
+        data = valid_steps()
+        if delete:
+            del data["steps"][index][field]
+        else:
+            data["steps"][index][field] = value
+        return workflow.validate_steps(data)
+
+    def assertStepError(self, errors, location, field):
+        self.assertTrue(errors, "expected errors")
+        self.assertTrue(any(e.startswith(location) and field in e for e in errors),
+                        "no error for %s %s in %r" % (location, field, errors))
+
+    def test_valid_steps_pass(self):
+        self.assertEqual([], workflow.validate_steps(valid_steps()))
+
+    def test_top_level_must_be_object(self):
+        self.assertTrue(workflow.validate_steps([]))
+        self.assertTrue(workflow.validate_steps(None))
+
+    def test_feature_required_non_empty_string(self):
+        for value in (None, "", "  ", 5):
+            data = valid_steps()
+            data["feature"] = value
+            self.assertStepError(workflow.validate_steps(data), "feature", "feature")
+        data = valid_steps()
+        del data["feature"]
+        self.assertStepError(workflow.validate_steps(data), "feature", "feature")
+
+    def test_steps_required_non_empty_list(self):
+        for value in (None, [], {}, "x"):
+            data = valid_steps()
+            data["steps"] = value
+            self.assertStepError(workflow.validate_steps(data), "steps", "steps")
+
+    def test_step_must_be_object(self):
+        data = valid_steps()
+        data["steps"].append("not a step")
+        self.assertStepError(workflow.validate_steps(data), "steps[2]", "object")
+
+    def test_id_must_be_positive_integer(self):
+        for value in (0, -1, "1", True, 1.5, None):
+            self.assertStepError(self.errors_for(0, "id", value), "steps[0]", "id")
+        self.assertStepError(self.errors_for(0, "id", None, delete=True), "steps[0]", "id")
+
+    def test_id_must_be_unique(self):
+        errors = self.errors_for(1, "id", 1)
+        self.assertEqual(1, len(errors))
+        self.assertStepError(errors, "steps[1] (id 1)", "id")
+
+    def test_title_required_and_max_72(self):
+        for value in ("", "   ", None, 7, "x" * 73):
+            self.assertStepError(self.errors_for(0, "title", value), "steps[0] (id 1)", "title")
+        self.assertStepError(self.errors_for(0, "title", None, delete=True), "steps[0] (id 1)", "title")
+        self.assertEqual([], self.errors_for(0, "title", "x" * 72))
+
+    def test_description_required(self):
+        for value in ("", None, ["x"]):
+            self.assertStepError(self.errors_for(1, "description", value), "steps[1] (id 2)", "description")
+        self.assertStepError(self.errors_for(1, "description", None, delete=True), "steps[1] (id 2)", "description")
+
+    def test_acceptance_non_empty_list_of_non_empty_strings(self):
+        for value in ([], "criterion", [""], ["ok", " "], [1], None):
+            self.assertStepError(self.errors_for(0, "acceptance", value), "steps[0] (id 1)", "acceptance")
+        self.assertStepError(self.errors_for(0, "acceptance", None, delete=True), "steps[0] (id 1)", "acceptance")
+
+    def test_status_must_be_known(self):
+        errors = self.errors_for(0, "status", "finished")
+        self.assertStepError(errors, "steps[0] (id 1)", "status")
+        self.assertIn("pending", errors[0])
+        self.assertStepError(self.errors_for(0, "status", None, delete=True), "steps[0] (id 1)", "status")
+        for value in ("pending", "active", "done", "empty"):
+            self.assertEqual([], self.errors_for(0, "status", value))
+
+    def test_type_must_be_conventional_commit_type(self):
+        self.assertStepError(self.errors_for(0, "type", "feature"), "steps[0] (id 1)", "type")
+        for value in ("feat", "fix", "refactor", "test", "docs", "chore", "perf", "build", "ci", "style"):
+            self.assertEqual([], self.errors_for(0, "type", value))
+
+    def test_files_must_be_list_of_strings(self):
+        for value in ("a.py", [1], None):
+            self.assertStepError(self.errors_for(0, "files", value), "steps[0] (id 1)", "files")
+        self.assertEqual([], self.errors_for(0, "files", []))
+
+    def test_commit_must_be_string_or_null(self):
+        self.assertStepError(self.errors_for(0, "commit", 123), "steps[0] (id 1)", "commit")
+        self.assertEqual([], self.errors_for(0, "commit", "abc123"))
+        self.assertEqual([], self.errors_for(0, "commit", None))
+
+    def test_reports_all_errors_at_once(self):
+        data = valid_steps()
+        data["steps"][0]["title"] = ""
+        data["steps"][1]["status"] = "bogus"
+        errors = workflow.validate_steps(data)
+        self.assertStepError(errors, "steps[0] (id 1)", "title")
+        self.assertStepError(errors, "steps[1] (id 2)", "status")
+
+    # --- immutability ------------------------------------------------------------
+
+    def history(self):
+        """Three steps: 1 done, 2 empty, 3 pending, 4 active."""
+        data = valid_steps()
+        data["steps"][0].update(status="done", commit="abc123")
+        data["steps"][1].update(status="empty")
+        data["steps"].append({"id": 3, "title": "Third", "description": "d", "acceptance": ["a"],
+                              "status": "pending"})
+        data["steps"].append({"id": 4, "title": "Fourth", "description": "d", "acceptance": ["a"],
+                              "status": "active"})
+        return data
+
+    def test_immutable_accepts_pending_edits(self):
+        previous = self.history()
+        current = self.history()
+        current["steps"][2].update(title="Renamed", description="New", acceptance=["x", "y"])
+        current["steps"][3]["description"] = "Changed active step"
+        current["steps"].append({"id": 9, "title": "New", "description": "d", "acceptance": ["a"],
+                                 "status": "pending", "commit": None})
+        current["steps"].insert(2, current["steps"].pop())  # move the new step before step 3
+        self.assertEqual([], workflow.check_steps_immutable(previous, current))
+        del current["steps"][3]  # remove pending step 3
+        self.assertEqual([], workflow.check_steps_immutable(previous, current))
+        current["steps"][2], current["steps"][3] = current["steps"][3], current["steps"][2]
+        self.assertEqual([], workflow.check_steps_immutable(previous, current))
+
+    def test_immutable_rejects_done_step_changed(self):
+        current = self.history()
+        current["steps"][0]["title"] = "Rewritten history"
+        self.assertStepError(workflow.check_steps_immutable(self.history(), current), "steps[0] (id 1)", "done")
+
+    def test_immutable_rejects_empty_step_changed(self):
+        current = self.history()
+        current["steps"][1]["acceptance"] = ["other"]
+        self.assertStepError(workflow.check_steps_immutable(self.history(), current), "steps[1] (id 2)", "empty")
+
+    def test_immutable_rejects_done_step_removed(self):
+        current = self.history()
+        del current["steps"][0]
+        errors = workflow.check_steps_immutable(self.history(), current)
+        self.assertTrue(any("id 1" in e and "removed" in e for e in errors), errors)
+
+    def test_immutable_rejects_done_steps_reordered(self):
+        current = self.history()
+        current["steps"][0], current["steps"][1] = current["steps"][1], current["steps"][0]
+        errors = workflow.check_steps_immutable(self.history(), current)
+        self.assertTrue(any("reordered" in e for e in errors), errors)
+
+    def test_immutable_rejects_status_change(self):
+        current = self.history()
+        current["steps"][2]["status"] = "done"
+        self.assertStepError(workflow.check_steps_immutable(self.history(), current), "steps[2] (id 3)", "status")
+
+    def test_immutable_rejects_commit_change(self):
+        current = self.history()
+        current["steps"][2]["commit"] = "def456"
+        self.assertStepError(workflow.check_steps_immutable(self.history(), current), "steps[2] (id 3)", "commit")
+
+    def test_immutable_rejects_new_step_not_pending(self):
+        new = {"id": 9, "title": "New", "description": "d", "acceptance": ["a"], "status": "active"}
+        current = self.history()
+        current["steps"].append(new)
+        self.assertStepError(workflow.check_steps_immutable(self.history(), current), "steps[4] (id 9)", "status")
+        new.update(status="pending", commit="abc999")
+        self.assertStepError(workflow.check_steps_immutable(self.history(), current), "steps[4] (id 9)", "commit")
+
 
 if __name__ == "__main__":
     unittest.main()

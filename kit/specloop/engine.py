@@ -32,6 +32,10 @@ BASE_DIR = os.path.join(".claude", "specloop")
 EDIT_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
 DONE = "done"
 CHECKLIST_ITEM = re.compile(r"^\s*- \[[ x]\]", re.IGNORECASE | re.MULTILINE)
+STEP_STATUSES = ("pending", "active", "done", "empty")
+LOCKED_STATUSES = ("done", "empty")
+COMMIT_TYPES = ("feat", "fix", "refactor", "test", "docs", "chore", "perf", "build", "ci", "style")
+MAX_TITLE_LENGTH = 72
 
 
 def project_dir(hook_input=None):
@@ -152,6 +156,108 @@ def tail(text, limit):
     return text if len(text) <= limit else "...(truncated)...\n" + text[-limit:]
 
 
+def head(text, limit):
+    return text if len(text) <= limit else text[:limit] + "\n...(truncated)"
+
+
+# --- steps file ------------------------------------------------------------------
+
+def _step_id(step):
+    value = step.get("id") if isinstance(step, dict) else None
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
+
+
+def _step_label(index, step):
+    step_id = _step_id(step)
+    return "steps[%d] (id %d)" % (index, step_id) if step_id is not None else "steps[%d]" % index
+
+
+def _non_empty_string(value):
+    return isinstance(value, str) and value.strip() != ""
+
+
+def validate_steps(data):
+    """Validate a parsed steps.json. Return a list of error strings; empty means valid."""
+    if not isinstance(data, dict):
+        return ["the top level must be an object with 'feature' and 'steps'"]
+    errors = []
+    if not _non_empty_string(data.get("feature")):
+        errors.append("feature must be a non-empty string")
+    steps = data.get("steps")
+    if not isinstance(steps, list) or not steps:
+        errors.append("steps must be a non-empty list")
+        return errors
+    seen = set()
+    for index, step in enumerate(steps):
+        label = _step_label(index, step)
+        if not isinstance(step, dict):
+            errors.append("%s: must be an object" % label)
+            continue
+        step_id = _step_id(step)
+        if step_id is None:
+            errors.append("%s: id must be a positive integer" % label)
+        elif step_id in seen:
+            errors.append("%s: id %d is not unique" % (label, step_id))
+        else:
+            seen.add(step_id)
+        title = step.get("title")
+        if not _non_empty_string(title):
+            errors.append("%s: title must be a non-empty string" % label)
+        elif len(title) > MAX_TITLE_LENGTH:
+            errors.append("%s: title must be at most %d characters (has %d)" % (label, MAX_TITLE_LENGTH, len(title)))
+        if not _non_empty_string(step.get("description")):
+            errors.append("%s: description must be a non-empty string" % label)
+        acceptance = step.get("acceptance")
+        if not isinstance(acceptance, list) or not acceptance or not all(_non_empty_string(a) for a in acceptance):
+            errors.append("%s: acceptance must be a non-empty list of non-empty strings" % label)
+        if step.get("status") not in STEP_STATUSES:
+            errors.append("%s: status must be one of %s" % (label, ", ".join(STEP_STATUSES)))
+        if "type" in step and step["type"] not in COMMIT_TYPES:
+            errors.append("%s: type must be one of %s" % (label, ", ".join(COMMIT_TYPES)))
+        if "files" in step and not (isinstance(step["files"], list) and all(isinstance(f, str) for f in step["files"])):
+            errors.append("%s: files must be a list of strings" % label)
+        if step.get("commit") is not None and not isinstance(step["commit"], str):
+            errors.append("%s: commit must be a string or null" % label)
+    return errors
+
+
+def check_steps_immutable(previous, current):
+    """Compare steps.json with a previously approved copy. Return errors for changes Claude may not make:
+    done/empty steps changed, removed or reordered; status or commit changed; new steps not pending."""
+    def by_id(data):
+        steps = data.get("steps") if isinstance(data, dict) else None
+        return [(i, s) for i, s in enumerate(steps or []) if _step_id(s) is not None]
+
+    old = {_step_id(s): s for _, s in by_id(previous)}
+    new_steps = by_id(current)
+    new_ids = {_step_id(s) for _, s in new_steps}
+    errors = []
+    for step_id, step in old.items():
+        if step.get("status") in LOCKED_STATUSES and step_id not in new_ids:
+            errors.append("step id %d is %s and was removed" % (step_id, step["status"]))
+    for index, step in new_steps:
+        label = _step_label(index, step)
+        before = old.get(_step_id(step))
+        if before is None:
+            if step.get("status") != "pending":
+                errors.append("%s: status of a new step must be pending" % label)
+            if step.get("commit") is not None:
+                errors.append("%s: commit of a new step must be null (the engine sets it)" % label)
+            continue
+        if before.get("status") in LOCKED_STATUSES and step != before:
+            errors.append("%s: step is %s and must not be changed" % (label, before["status"]))
+            continue
+        if step.get("status") != before.get("status"):
+            errors.append("%s: status is set by the engine and must stay %s" % (label, before.get("status")))
+        if step.get("commit") != before.get("commit"):
+            errors.append("%s: commit is set by the engine and must not be changed" % label)
+    locked_before = [i for i, s in old.items() if s.get("status") in LOCKED_STATUSES and i in new_ids]
+    locked_now = [_step_id(s) for _, s in new_steps if _step_id(s) in locked_before]
+    if locked_now != locked_before:
+        errors.append("done/empty steps were reordered: expected ids %s in that order" % locked_before)
+    return errors
+
+
 # --- checks --------------------------------------------------------------------
 
 def check_phase(root, config, phase):
@@ -189,6 +295,22 @@ def check_phase(root, config, phase):
         if check["reject"] in text:
             return "reject", tail(text, limit)
         return "fail", "%s must contain '%s' or '%s'." % (check["path"], check["approve"], check["reject"])
+    if kind == "steps":
+        path = os.path.join(root, check["path"])
+        if not os.path.exists(path):
+            return "fail", "Steps file %s is missing." % check["path"]
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+        except ValueError as e:
+            return "fail", "Steps file %s is not valid JSON: %s" % (check["path"], e)
+        errors = validate_steps(data)
+        if not errors and check.get("requireAllPending"):
+            errors = ["%s: status must be pending, not %s" % (_step_label(i, s), s["status"])
+                      for i, s in enumerate(data["steps"]) if s["status"] != "pending"]
+        if errors:
+            return "fail", head("Steps file %s is invalid:\n%s" % (check["path"], "\n".join(errors)), limit)
+        return "pass", "%s is valid" % check["path"]
     return "fail", "Unknown check type '%s'." % kind
 
 
