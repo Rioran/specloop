@@ -388,6 +388,22 @@ def check_steps_immutable(previous, current):
 
 # --- checks --------------------------------------------------------------------
 
+def find_verdict(text, check):
+    """Return 'pass', 'reject' or None from the verdict lines of a review.
+
+    A verdict line is a whole line equal to check["approve"] or check["reject"], ignoring surrounding
+    whitespace and Markdown emphasis. The last one wins, so a review that quotes both markers while
+    discussing them does not pass by accident, and a reviewer who changes their mind is read correctly."""
+    verdict = None
+    for line in text.splitlines():
+        line = line.strip().strip("`*_").strip()
+        if line == check["approve"]:
+            verdict = "pass"
+        elif line == check["reject"]:
+            verdict = "reject"
+    return verdict
+
+
 def check_phase(root, config, phase_config):
     """Run the check of one phase (its config dict from the phase graph).
 
@@ -422,11 +438,13 @@ def check_phase(root, config, phase_config):
             return _same("fail", "Review file %s is missing." % check["path"])
         with open(path, encoding="utf-8", errors="replace") as f:
             text = f.read()
-        if check["approve"] in text:
+        verdict = find_verdict(text, check)
+        if verdict == "pass":
             return "pass", "review approved", ""
-        if check["reject"] in text:
+        if verdict == "reject":
             return "reject", tail(text, limit), text
-        return _same("fail", "%s must contain '%s' or '%s'." % (check["path"], check["approve"], check["reject"]))
+        return _same("fail", "%s must contain a verdict line: exactly '%s' or '%s' on a line of its own." % (
+            check["path"], check["approve"], check["reject"]))
     if kind == "steps":
         path = os.path.join(root, check["path"])
         if not os.path.exists(path):

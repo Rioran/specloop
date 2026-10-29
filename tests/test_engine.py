@@ -123,6 +123,36 @@ class EngineTest(unittest.TestCase):
         self.assertIn("must contain", out["reason"])
         self.assertEqual("review", self.state()["phase"])
 
+    def review(self, text):
+        """Run plan and implement, write review.md with text, return the Stop output of the review phase."""
+        self.start()
+        self.write_run("plan.md", "plan")
+        workflow.handle_stop(self.root, {})
+        workflow.handle_stop(self.root, {})
+        self.write_run("review.md", text)
+        return workflow.handle_stop(self.root, {})
+
+    def test_verdict_quoted_in_prose_does_not_count(self):
+        out = self.review("I would write VERDICT: APPROVE once the null check is in; until then it is\n"
+                          "VERDICT: CHANGES_REQUESTED territory.\n\nVERDICT: CHANGES_REQUESTED\n")
+        self.assertEqual("block", out["decision"])
+        self.assertEqual("implement", self.state()["phase"])
+
+    def test_verdict_only_in_prose_blocks(self):
+        out = self.review("Write VERDICT: APPROVE or VERDICT: CHANGES_REQUESTED at the end.")
+        self.assertIn("must contain", out["reason"])
+        self.assertEqual("review", self.state()["phase"])
+
+    def test_last_verdict_line_wins(self):
+        out = self.review("VERDICT: APPROVE\n\nOn second thought the test is missing.\n\nVERDICT: CHANGES_REQUESTED\n")
+        self.assertEqual("implement", self.state()["phase"])
+        self.assertIn("second thought", out["reason"])
+
+    def test_verdict_line_may_carry_markdown_emphasis(self):
+        out = self.review("All good.\n\n  **`VERDICT: APPROVE`**  \n")
+        self.assertNotIn("decision", out)
+        self.assertEqual("done", self.state()["status"])
+
     def test_stalls_after_max_iterations_and_go_resumes(self):
         self.set_test_command("exit 0", max_iterations=2)
         self.start()
