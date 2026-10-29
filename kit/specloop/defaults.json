@@ -1,0 +1,31 @@
+{
+  "commandPrefix": "sl-",
+  "initialPhase": "plan",
+  "maxIterations": 15,
+  "checkTimeoutSec": 900,
+  "maxOutputChars": 4000,
+  "shell": "bash",
+  "blockedCommandsUntilDone": ["git push", "gh pr create", "gh pr merge"],
+  "phases": {
+    "plan": {
+      "next": "implement",
+      "allowEdits": [".claude/specloop/run/"],
+      "check": { "type": "file", "path": ".claude/specloop/run/plan.md" }
+    },
+    "implement": {
+      "next": "review",
+      "check": null
+    },
+    "review": {
+      "next": "done",
+      "allowEdits": [".claude/specloop/run/"],
+      "check": {
+        "type": "verdict",
+        "path": ".claude/specloop/run/review.md",
+        "approve": "VERDICT: APPROVE",
+        "reject": "VERDICT: CHANGES_REQUESTED",
+        "onReject": "implement"
+      }
+    }
+  }
+}
