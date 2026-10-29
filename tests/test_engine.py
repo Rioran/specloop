@@ -35,7 +35,7 @@ class EngineTest(unittest.TestCase):
                          "phases": {"implement": {"check": {"type": "command", "command": command}}}})
 
     def write_run(self, name, text):
-        with open(os.path.join(self.base, "run", name), "w") as f:
+        with open(os.path.join(self.base, "run", name), "w", encoding="utf-8") as f:
             f.write(text)
 
     def write_override(self, phase, text):
@@ -159,7 +159,7 @@ class EngineTest(unittest.TestCase):
         self.assertEqual("done", self.state()["status"])
 
     def test_verdict_file_with_bom_is_read(self):
-        out = self.review("﻿VERDICT: APPROVE\n")
+        out = self.review("\ufeffVERDICT: APPROVE\n")
         self.assertNotIn("decision", out)
         self.assertEqual("done", self.state()["status"])
 
@@ -702,8 +702,9 @@ class VerdictTest(unittest.TestCase):
         return workflow.find_verdict(text, check or self.CHECK)
 
     def test_decorated_verdict_lines_count(self):
-        for line in ("- `VERDICT: APPROVE`", "## VERDICT: APPROVE", "> VERDICT: APPROVE", "VERDICT: APPROVE.",
-                     "**VERDICT: APPROVE**.", "** `VERDICT: APPROVE` **", "\tVERDICT: APPROVE \r"):
+        for line in ("- `VERDICT: APPROVE`", "* VERDICT: APPROVE", "## VERDICT: APPROVE", "> VERDICT: APPROVE",
+                     "> - **VERDICT: APPROVE**", "VERDICT: APPROVE.", "**VERDICT: APPROVE**.",
+                     "** `VERDICT: APPROVE` **", "```VERDICT: APPROVE```", "\tVERDICT: APPROVE \r"):
             self.assertEqual("pass", self.verdict("Notes.\n" + line + "\n"), line)
 
     def test_verdict_with_other_text_on_the_line_does_not_count(self):
@@ -716,11 +717,28 @@ class VerdictTest(unittest.TestCase):
         self.assertEqual("reject", self.verdict(text))
         self.assertIsNone(self.verdict("~~~md\nVERDICT: APPROVE\n~~~\n"))
 
+    def test_code_fences_follow_markdown_rules(self):
+        quoted = "```\nVERDICT: APPROVE\n```\n"
+        # A fence closes only on a bare run of the same character that is at least as long.
+        self.assertEqual("reject", self.verdict("VERDICT: CHANGES_REQUESTED\n````md\n" + quoted + "````\n"))
+        self.assertEqual("reject", self.verdict("VERDICT: CHANGES_REQUESTED\n~~~md\n" + quoted + "~~~\n"))
+        self.assertEqual("pass", self.verdict("VERDICT: CHANGES_REQUESTED\n```\n~~~\n```\nVERDICT: APPROVE\n"))
+        # Inline code at the start of a line is not a fence; a fence inside a blockquote is one.
+        self.assertEqual("reject", self.verdict("```x``` is wrong.\n" + quoted + "VERDICT: CHANGES_REQUESTED\n"))
+        self.assertEqual("reject", self.verdict("VERDICT: CHANGES_REQUESTED\n> ```\n> VERDICT: APPROVE\n> ```\n"))
+
     def test_custom_markers_are_normalized_like_lines(self):
         check = {"approve": "**LGTM**", "reject": "`NOPE`"}
         self.assertEqual("pass", self.verdict("**LGTM**\n", check))
         self.assertEqual("pass", self.verdict("LGTM\n", check))
         self.assertEqual("reject", self.verdict("- NOPE\n", check))
+
+    def test_custom_markers_that_collide_when_normalized_are_compared_as_written(self):
+        check = {"approve": "+1", "reject": "-1"}
+        self.assertEqual("reject", self.verdict("Missing test.\n-1\n", check))
+        self.assertEqual("pass", self.verdict("+1\n", check))
+        self.assertIsNone(self.verdict("1.\n", check))
+        self.assertEqual("reject", self.verdict("NO\n\nmore\n", {"approve": "**", "reject": "NO"}))
 
     def test_reject_marker_is_optional(self):
         check = {"approve": "LGTM"}

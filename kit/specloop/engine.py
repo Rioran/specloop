@@ -43,9 +43,9 @@ FAILURE_FILE = "last-failure.md"
 COMMIT = "commit"
 REPLAN_FILE = "replan.md"
 MAX_SLUG_LENGTH = 50
-VERDICT_PREFIX = "#>-*+ \t"  # Markdown heading, quote and list markers before a verdict
+VERDICT_PREFIX = re.compile(r"^(?:\s|>|#+(?=\s)|[-+*](?=\s))+")  # Markdown quote, heading and list markers
 VERDICT_WRAP = " \t`*_."  # whitespace, emphasis and a trailing period around a verdict
-CODE_FENCE = ("```", "~~~")
+CODE_FENCE = re.compile(r"[ \t>]*(`{3,}|~{3,})(.*)$")  # fence run and its info string
 
 
 def project_dir(hook_input=None):
@@ -393,7 +393,16 @@ def check_steps_immutable(previous, current):
 
 def verdict_line(line):
     """Reduce a review line (or a configured marker) to its bare text: "- `VERDICT: APPROVE`." -> "VERDICT: APPROVE"."""
-    return line.strip().lstrip(VERDICT_PREFIX).strip(VERDICT_WRAP)
+    return VERDICT_PREFIX.sub("", line.strip()).strip(VERDICT_WRAP)
+
+
+def code_fence(line):
+    """Return (fence, info) when the line opens or closes a fenced code block, else None (CommonMark:
+    a backtick fence may not have a backtick in its info string, that is inline code)."""
+    match = CODE_FENCE.match(line)
+    if not match or (match.group(1)[0] == "`" and "`" in match.group(2)):
+        return None
+    return match.group(1), match.group(2).strip()
 
 
 def find_verdict(text, check):
@@ -403,15 +412,20 @@ def find_verdict(text, check):
     optional check["reject"]; lines inside fenced code blocks are skipped. So a marker quoted inside a
     sentence or a code block never counts. The last verdict line wins, so a reviewer who changes their
     mind is read correctly."""
-    approve, reject = verdict_line(check["approve"]), verdict_line(check.get("reject") or "")
-    verdict, fenced = None, False
+    approve, reject, bare = verdict_line(check["approve"]), verdict_line(check.get("reject") or ""), verdict_line
+    if not approve or approve == reject:  # markers that are nothing but decoration: compare them as written
+        approve, reject, bare = check["approve"].strip(), (check.get("reject") or "").strip(), str.strip
+    verdict, fence = None, ""
     for line in text.splitlines():
-        if line.lstrip().startswith(CODE_FENCE):
-            fenced = not fenced
+        found = code_fence(line)
+        if fence:  # only a bare run of the same character, at least as long, closes the block
+            if found and found[0][0] == fence[0] and len(found[0]) >= len(fence) and not found[1]:
+                fence = ""
             continue
-        line = verdict_line(line)
-        if fenced:
+        if found:
+            fence = found[0]
             continue
+        line = bare(line)
         if line == approve:
             verdict = "pass"
         elif reject and line == reject:
