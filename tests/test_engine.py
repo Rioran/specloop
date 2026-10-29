@@ -1406,6 +1406,149 @@ class FeatureModeTest(unittest.TestCase):
         ])
         self.assertEqual(expected, workflow.cmd_status(self.root))
 
+    # --- replanning ----------------------------------------------------------------
+
+    def three_steps(self):
+        data = self.two_steps()
+        data["steps"].append({"id": 3, "title": "Third step", "description": "More work.",
+                              "acceptance": ["It works"], "status": "pending"})
+        return data
+
+    def request_replan(self):
+        self.write("wip.py", "work = 'in progress'\n")
+        self.write_run("replan.md", "Step 2 is wrong: it should be split.\n")
+        return workflow.handle_stop(self.root, {})
+
+    def assertWipSurvives(self):
+        self.assertTrue(os.path.exists(os.path.join(self.root, "wip.py")))
+        self.assertIn("wip.py", self.git("status", "--porcelain", "--untracked-files=all"))
+
+    def test_replan_request_stalls_by_default(self):
+        self.approve(implement_command="echo tests-$((40+2)); exit 1")
+        out = self.request_replan()
+        self.assertNotIn("decision", out)
+        for needle in ("replan.md", "steps.json", "/sl-go"):
+            self.assertIn(needle, out["systemMessage"])
+        state = self.state()
+        self.assertEqual(("stalled", "implement", 0), (state["status"], state["phase"], state["iter"]))
+        self.assertTrue(state["replanRequested"])
+        self.assertFalse(os.path.exists(os.path.join(self.base, "run", "last-failure.md")))
+        self.assertIsNone(workflow.handle_stop(self.root, {}))
+
+    def test_stall_resume_adopts_valid_edit_and_restarts_step(self):
+        self.approve()
+        self.request_replan()
+        self.write_steps(lambda d: d["steps"][1].update(title="Split documentation"))
+        out = workflow.cmd_go(self.root)
+        state = self.state()
+        self.assertEqual(("active", "implement", 1, 0), (state["status"], state["phase"], state["stepId"], state["iter"]))
+        self.assertEqual("Split documentation", state["approvedSteps"]["steps"][1]["title"])
+        self.assertNotIn("replanRequested", state)
+        self.assertIn("Add steps.json schema validation", out)
+        self.assertTrue(os.path.exists(os.path.join(self.base, "run", "replans", "replan-1.md")))
+        self.assertFalse(os.path.exists(os.path.join(self.base, "run", "replan.md")))
+        self.assertEqual(state["approvedSteps"], self.steps_file())
+        self.assertWipSurvives()
+
+    def test_stall_resume_refuses_invalid_edit_without_changes(self):
+        self.approve()
+        self.run_step({"a.py": "a = 1\n"})
+        self.request_replan()
+        self.write_steps(lambda d: d["steps"][0].update(title="Rewritten history"))
+        before = self.state_bytes()
+        out = workflow.cmd_go(self.root)
+        self.assertIn("steps[0] (id 1)", out)
+        self.assertEqual(before, self.state_bytes())
+        self.assertTrue(os.path.exists(os.path.join(self.base, "run", "replan.md")))
+
+    def test_stall_resume_with_current_step_removed_starts_next_or_completes(self):
+        self.approve(self.three_steps())
+        self.run_step({"a.py": "a = 1\n"})
+        self.request_replan()
+        self.write_steps(lambda d: d["steps"].pop(1))
+        workflow.cmd_go(self.root)
+        self.assertEqual(("active", 3, "implement"),
+                         (self.state()["status"], self.state()["stepId"], self.state()["phase"]))
+
+        self.request_replan()
+        self.write_steps(lambda d: d["steps"].pop(1))
+        out = workflow.cmd_go(self.root)
+        self.assertEqual("done", self.state()["status"])
+        self.assertIn("specloop/my-big-feature", out)
+        self.assertTrue(os.path.exists(os.path.join(self.base, "run", "replans", "replan-2.md")))
+
+    def test_auto_replan_enters_replan_phase(self):
+        self.approve(feature={"replan": "auto"})
+        out = self.request_replan()
+        self.assertEqual("block", out["decision"])
+        self.assertIn("feature-replan", out["reason"])
+        self.assertIn("- `.claude/specloop/run/replan.md`", out["reason"])
+        self.assertIn("## Phase: feature-replan", out["reason"])
+        state = self.state()
+        self.assertEqual(("active", "feature-replan", 0, 1), (state["status"], state["phase"], state["iter"],
+                                                              state["replanCount"]))
+        src = os.path.join(self.root, "src", "x.py")
+        denied = workflow.handle_pretool(self.root, {"tool_name": "Edit", "tool_input": {"file_path": src}})
+        self.assertEqual("deny", denied["hookSpecificOutput"]["permissionDecision"])
+
+    def test_auto_replan_valid_rewrite_returns_to_implement(self):
+        self.approve(feature={"replan": "auto"})
+        self.request_replan()
+        self.write_steps(lambda d: d["steps"][1].update(description="Rewritten by the replan subagent."))
+        out = workflow.handle_stop(self.root, {})
+        self.assertEqual("block", out["decision"])
+        self.assertIn("Replan adopted", out["reason"])
+        state = self.state()
+        self.assertEqual(("implement", 1, 0), (state["phase"], state["stepId"], state["iter"]))
+        self.assertEqual("Rewritten by the replan subagent.", state["approvedSteps"]["steps"][1]["description"])
+        self.assertTrue(os.path.exists(os.path.join(self.base, "run", "replans", "replan-1.md")))
+        self.assertWipSurvives()
+        self.assertIn("entering phase 'review'", workflow.handle_stop(self.root, {})["reason"])
+
+    def test_auto_replan_done_step_edit_fails_gate(self):
+        self.approve(feature={"replan": "auto"})
+        self.run_step({"a.py": "a = 1\n"})
+        self.request_replan()
+        approved = self.state()["approvedSteps"]
+        self.write_steps(lambda d: d["steps"][0].update(title="Rewritten history"))
+        out = workflow.handle_stop(self.root, {})
+        self.assertEqual("block", out["decision"])
+        self.assertIn("steps[0] (id 1)", out["reason"])
+        self.assertEqual("feature-replan", self.state()["phase"])
+        self.assertEqual(approved, self.state()["approvedSteps"])
+
+    def test_fourth_auto_replan_stalls_at_cap(self):
+        self.approve(feature={"replan": "auto", "maxReplans": 3})
+        for n in range(1, 4):
+            self.request_replan()
+            self.assertEqual("feature-replan", self.state()["phase"])
+            workflow.handle_stop(self.root, {})
+            self.assertEqual("implement", self.state()["phase"])
+            self.assertTrue(os.path.exists(os.path.join(self.base, "run", "replans", "replan-%d.md" % n)))
+        out = self.request_replan()
+        self.assertEqual("stalled", self.state()["status"])
+        self.assertIn("3", out["systemMessage"])
+        self.assertIn("cap", out["systemMessage"])
+
+    def test_advance_in_replan_phase_adopts_plan(self):
+        self.approve(feature={"replan": "auto"})
+        self.request_replan()
+        self.write_steps(lambda d: d["steps"][1].update(title="Advanced"))
+        workflow.cmd_advance(self.root)
+        self.assertEqual(("active", "implement"), (self.state()["status"], self.state()["phase"]))
+        self.assertEqual("Advanced", self.state()["approvedSteps"]["steps"][1]["title"])
+
+    def test_step_instructions_mention_replan(self):
+        self.assertIn(".claude/specloop/run/replan.md", self.approve())
+        self.write("a.py", "a = 1\n")
+        self.assertIn(".claude/specloop/run/replan.md", workflow.handle_stop(self.root, {})["reason"])
+
+    def test_replan_file_ignored_during_planning(self):
+        self.start()
+        self.write_run("replan.md", "not yet")
+        self.pass_planning()
+        self.assertTrue(self.state()["awaitingApproval"])
+
 
 if __name__ == "__main__":
     unittest.main()

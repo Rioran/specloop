@@ -17,8 +17,16 @@
         "delegate": true,
         "allowEdits": [".claude/specloop/run/"],
         "check": { "type": "steps", "path": ".claude/specloop/run/steps.json", "requireAllPending": true }
+      },
+      "feature-replan": {
+        "delegate": true,
+        "allowEdits": [".claude/specloop/run/"],
+        "check": { "type": "steps", "path": ".claude/specloop/run/steps.json", "requireAllPending": false }
       }
     },
+    "replan": "stall",
+    "replanPhase": "feature-replan",
+    "maxReplans": 3,
     "stepInitialPhase": "implement",
     "stepPhases": {
       "implement": {

@@ -41,6 +41,7 @@ COMMIT_TYPES = ("feat", "fix", "refactor", "test", "docs", "chore", "perf", "bui
 MAX_TITLE_LENGTH = 72
 FAILURE_FILE = "last-failure.md"
 COMMIT = "commit"
+REPLAN_FILE = "replan.md"
 MAX_SLUG_LENGTH = 50
 
 
@@ -108,7 +109,14 @@ def phase_graph(config, state):
     `feature.planPhases` while planning and `feature.stepPhases` while a step is active."""
     if not is_feature(state):
         return config["phases"]
-    return config["feature"]["stepPhases"] if in_step(state) else config["feature"]["planPhases"]
+    if in_step(state) and not in_replan(config, state):
+        return config["feature"]["stepPhases"]
+    return config["feature"]["planPhases"]
+
+
+def in_replan(config, state):
+    """True while a feature run is in the replan phase (a step is still recorded as current)."""
+    return in_step(state) and state.get("phase") == config["feature"].get("replanPhase", "feature-replan")
 
 
 def current_step(state):
@@ -204,6 +212,8 @@ def phase_brief(root, config, state):
         files.append(_rel("run", "plan.md"))
     if is_feature(state) and "steps.json" in names:
         files.append(_rel("run", "steps.json"))
+    if is_feature(state) and REPLAN_FILE in names:
+        files.append(_rel("run", REPLAN_FILE))
     files += [_rel("run", n) for n in names if n.startswith("review") and n.endswith(".md")]
     if FAILURE_FILE in names:
         files.append(_rel("run", FAILURE_FILE))
@@ -613,6 +623,82 @@ def steps_file_violation(root, state):
     return "%s may only be changed by specloop: %s\n%s\n\n%s" % (rel, errors[0], "\n".join(errors[1:]), restore)
 
 
+def replan_candidate(root, state):
+    """Load run/steps.json as a proposed replan. Return (data, errors); errors is empty when it may be adopted."""
+    rel = _rel("run", "steps.json")
+    try:
+        with open(os.path.join(run_dir(root), "steps.json"), encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return None, ["%s is missing" % rel]
+    except ValueError as e:
+        return None, ["%s is not valid JSON: %s" % (rel, e)]
+    return data, validate_steps(data) or check_steps_immutable(state.get("approvedSteps") or {}, data)
+
+
+def archive_replan(root):
+    """Move run/replan.md to run/replans/replan-N.md with the next free N."""
+    src = os.path.join(run_dir(root), REPLAN_FILE)
+    if not os.path.exists(src):
+        return
+    dest = os.path.join(run_dir(root), "replans")
+    os.makedirs(dest, exist_ok=True)
+    numbers = [int(m.group(1)) for m in (re.match(r"replan-(\d+)\.md$", n) for n in os.listdir(dest)) if m]
+    os.replace(src, os.path.join(dest, "replan-%d.md" % (max(numbers or [0]) + 1)))
+
+
+def adopt_replan(root, config, state, data):
+    """Store a validated replan as approvedSteps and continue. Return 'restart' (the current step starts over),
+    'next' (the current step was removed and the next one started) or 'done' (no steps remain)."""
+    state["approvedSteps"] = data
+    state.pop("replanRequested", None)
+    archive_replan(root)
+    clear_failure(root)
+    if current_step(state)[1] is not None:
+        state.update(phase=config["feature"].get("stepInitialPhase", "implement"), iter=0, lastFailure=None)
+        save_steps(root, state)
+        return "restart"
+    if start_next_step(root, config, state) is None:
+        save_steps(root, state)
+        state.update(status="done", phase=DONE)
+        return "done"
+    return "next"
+
+
+def replan_adopted(root, config, state, kind):
+    """Stop-hook result after a replan was adopted."""
+    save_state(root, state)
+    if kind == "done":
+        return {"systemMessage": "[specloop] Replan adopted; no steps remain. " + completion_message(config, state)}
+    what = "Restarting" if kind == "restart" else "The current step was removed; starting"
+    return {"decision": "block", "reason": "Replan adopted. %s %s.\n\n%s" % (
+        what, step_label(state)[0].lower(), phase_prompt(root, config, state))}
+
+
+def request_replan(root, config, state):
+    """Claude wrote run/replan.md during a step: enter the replan phase (auto) or stall for the user."""
+    feature = config["feature"]
+    state.setdefault("history", []).append({"phase": state["phase"], "result": "replan", "at": now()})
+    count, cap = state.get("replanCount", 0), feature.get("maxReplans", 3)
+    auto = feature.get("replan", "stall") == "auto"
+    if auto and count < cap:
+        clear_failure(root)
+        state.update(replanCount=count + 1, phase=feature.get("replanPhase", "feature-replan"), iter=0,
+                     lastFailure=None)
+        save_state(root, state)
+        return {"decision": "block", "reason": "Replan requested in %s. Entering phase '%s' (auto-replan %d of %d)."
+                "\n\n%s" % (_rel("run", REPLAN_FILE), state["phase"], count + 1, cap,
+                            phase_prompt(root, config, state))}
+    state.update(status="stalled", replanRequested=True)
+    save_state(root, state)
+    cap_note = " The cap of %d auto-replans per run is reached, so this one needs you." % cap if auto else ""
+    return {"systemMessage": (
+        "[specloop] Claude requested a replan of the remaining steps.%s Read %s, optionally edit the pending or "
+        "active steps in %s, then run %s. The current step then restarts with the adopted plan; uncommitted work "
+        "stays in the working tree." % (cap_note, _rel("run", REPLAN_FILE), _rel("run", "steps.json"),
+                                       cmd_name(config, "go")))}
+
+
 def save_steps(root, state):
     """Write approvedSteps (including engine-owned status/commit changes) back to run/steps.json."""
     with open(os.path.join(run_dir(root), "steps.json"), "w", encoding="utf-8") as f:
@@ -746,11 +832,21 @@ def handle_stop(root, hook_input):
     config = load_config(root)
     phase = state["phase"]
     graph = phase_graph(config, state)
-    violation = steps_file_violation(root, state) if in_step(state) else None
+    replanning = in_replan(config, state)
+    if in_step(state) and not replanning and os.path.exists(os.path.join(run_dir(root), REPLAN_FILE)):
+        return request_replan(root, config, state)
+    limit = config.get("maxOutputChars", 4000)
+    violation = steps_file_violation(root, state) if in_step(state) and not replanning else None
     if violation:
-        result, details, full = "fail", head(violation, config.get("maxOutputChars", 4000)), violation
+        result, details, full = "fail", head(violation, limit), violation
     else:
         result, details, full = check_phase(root, config, graph[phase])
+        if result == "pass" and replanning:
+            errors = replan_candidate(root, state)[1]
+            if errors:
+                full = "%s may only change pending or active steps: %s\n%s" % (
+                    _rel("run", "steps.json"), errors[0], "\n".join(errors[1:]))
+                result, details = "fail", head(full, limit)
     state["iter"] = state.get("iter", 0) + 1
     state.setdefault("history", []).append(
         {"phase": phase, "result": result, "at": now(), "iter": state["iter"]})
@@ -758,6 +854,9 @@ def handle_stop(root, hook_input):
     if result == "pass":
         clear_failure(root)
         state["lastFailure"] = None
+        if replanning:
+            kind = adopt_replan(root, config, state, replan_candidate(root, state)[0])
+            return replan_adopted(root, config, state, kind)
         if is_feature(state) and not in_step(state) and phase == config["feature"].get("planPhase"):
             if config["feature"].get("requirePlanApproval", True):
                 return {"systemMessage": "[specloop] " + await_approval(root, config, state)}
@@ -957,6 +1056,14 @@ def cmd_go(root):
             error = approve_plan(root, config, state)
             if error:
                 return error
+        if state["status"] == "stalled" and state.get("replanRequested"):
+            data, errors = replan_candidate(root, state)
+            if errors:
+                return "The replan cannot be adopted yet:\n%s\n\nFix %s, then run %s again." % (
+                    "\n".join(errors), _rel("run", "steps.json"), cmd_name(config, "go"))
+            if adopt_replan(root, config, state, data) == "done":
+                save_state(root, state)
+                return "Replan adopted; no steps remain. " + completion_message(config, state)
     elif state["status"] == "ready" and not state.get("largeSpecAcknowledged"):
         warning = spec_size_warning(root, config, state.get("spec", ""))
         if warning and not state.get("largeSpecWarned"):
@@ -989,6 +1096,17 @@ def cmd_advance(root):
     if not state or state["phase"] == DONE:
         return "Nothing to advance."
     config = load_config(root)
+    if in_replan(config, state):
+        # Force-passing the replan phase adopts the current steps.json if it is acceptable.
+        data, errors = replan_candidate(root, state)
+        if errors:
+            return "The replan cannot be adopted:\n%s" % "\n".join(errors)
+        state.setdefault("history", []).append({"phase": state["phase"], "result": "skipped", "at": now()})
+        kind = adopt_replan(root, config, state, data)
+        save_state(root, state)
+        if kind == "done":
+            return "Replan adopted; no steps remain. " + completion_message(config, state)
+        return "Replan adopted. Now in %s, phase '%s'." % (step_label(state)[0].lower(), state["phase"])
     clear_failure(root)
     state.setdefault("history", []).append({"phase": state["phase"], "result": "skipped", "at": now()})
     if is_feature(state) and not in_step(state) and state["phase"] == config["feature"].get("planPhase"):
