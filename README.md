@@ -142,6 +142,20 @@ To add a phase, for example `docs` after `implement`, define it in `config.json`
 
 In instruction files, `{spec}` becomes the spec path and `{run_dir}` becomes `.claude/specloop/run`.
 
+Whenever a check fails or a review requests changes, the full details (the complete check output or review text, not truncated) are written to `.claude/specloop/run/last-failure.md`. The file is removed when a phase passes and on `/sl-advance`.
+
+### Delegating a phase to a subagent
+
+Set `"delegate": true` on any phase (default `false`; no shipped phase enables it) to run that phase in a fresh context:
+
+```json
+{ "phases": { "implement": { "delegate": true } } }
+```
+
+In a delegated phase the main session acts as an orchestrator. Instead of the bare phase instructions, `/sl-go`, the Stop hook and the session context give it an orchestration preamble (`phases/delegate.md`, overridable with `overrides/delegate.md`; `{brief}` marks where the brief goes). The preamble tells it to start exactly one subagent with a self-contained **phase brief**, not to read or edit files itself, and to finish its turn with a summary of at most 5 lines. The brief holds the rendered phase instructions and the files the subagent should read: the spec, `run/plan.md`, any `run/review*.md`, and `run/last-failure.md`. When a check fails, the Stop hook's message stays short and points at `run/last-failure.md` instead of including the full output.
+
+Gates still run only when the main session stops; specloop registers no `SubagentStop` hook. Note that a phase named `delegate` would share its instructions file with the preamble.
+
 ### Large specs and plans
 
 A single plan → implement → review cycle works best for changes that fit in one commit. specloop warns when a spec or plan looks bigger than that, and recommends `/sl-feature` (feature mode, which splits work into multiple commits) instead.
@@ -174,6 +188,12 @@ Set a key to `null` to disable that check, or the whole block to disable all of 
 - If you commit `.claude/settings.json` with `--scope project`, every teammate who opens the repo gets the hooks. Without a loaded spec the hooks do nothing, so that's harmless.
 - A long test suite runs on every Stop during `implement`. Point `check.command` at a fast subset if needed.
 - Claude can't stop to ask you questions while a phase is active. Use `/sl-pause`, or let it record assumptions in `plan.md`. The plan instructions already ask for that.
+
+## Hacks and limitations
+
+- **Delegation is instruction-only and not guaranteed.** Hooks cannot start subagents, so `delegate: true` only *tells* the main session to hand the phase to a subagent. It may do the work itself anyway, for example after context compaction or when it judges the phase to be small. The gates still protect the result either way; only the fresh-context benefit is lost.
+  - *How to notice:* in a delegated phase, the main session reads source files, edits files or runs the tests itself instead of starting one subagent.
+  - *How to recover:* run `/sl-pause`, then `/clear`, then `/sl-go`. `/sl-go` re-sends the orchestrator instructions with the phase brief to a clean context.
 
 ## Uninstall
 

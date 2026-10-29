@@ -57,6 +57,14 @@ class InstallTest(unittest.TestCase):
         config = self.read_json(".claude", "specloop", "config.json")
         self.assertEqual("make test", config["phases"]["implement"]["check"]["command"])
 
+    def test_no_subagent_stop_hook_installed(self):
+        install.install(self.root, test_command="make test")
+        self.assertTrue(os.path.exists(self.path(".claude", "specloop", "phases", "delegate.md")))
+        hooks = self.read_json(".claude", "settings.json")["hooks"]
+        self.assertNotIn("SubagentStop", hooks)
+        self.assertEqual({"SessionStart", "UserPromptSubmit", "PreToolUse", "Stop"},
+                         {event for event in hooks if self.specloop_groups({"hooks": hooks}, event)})
+
     def test_install_preserves_foreign_settings_and_is_idempotent(self):
         foreign = {"permissions": {"allow": ["Bash(ls)"]},
                    "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "echo mine"}]}]}}

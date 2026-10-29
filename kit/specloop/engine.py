@@ -36,6 +36,7 @@ STEP_STATUSES = ("pending", "active", "done", "empty")
 LOCKED_STATUSES = ("done", "empty")
 COMMIT_TYPES = ("feat", "fix", "refactor", "test", "docs", "chore", "perf", "build", "ci", "style")
 MAX_TITLE_LENGTH = 72
+FAILURE_FILE = "last-failure.md"
 
 
 def project_dir(hook_input=None):
@@ -104,23 +105,69 @@ def cmd_name(config, name):
     return "/" + config.get("commandPrefix", "") + name
 
 
+def _kit_text(root, name, custom=None):
+    """Read <custom>, overrides/<name>.md or phases/<name>.md, whichever exists first; None if none does."""
+    names = [custom] if custom else []
+    names += [os.path.join("overrides", name + ".md"), os.path.join("phases", name + ".md")]
+    for candidate in names:
+        path = candidate if os.path.isabs(candidate) else _path(root, candidate)
+        if os.path.exists(path):
+            with open(path, encoding="utf-8") as f:
+                return f.read()
+    return None
+
+
+def _render(text, state):
+    return text.replace("{spec}", state.get("spec", "")).replace("{run_dir}", _rel("run"))
+
+
 def phase_instructions(root, config, state):
     phase = state["phase"]
     if phase == DONE:
         return "The workflow is complete."
-    names = []
-    custom = config["phases"].get(phase, {}).get("instructions")
-    if custom:
-        names.append(custom)
-    names += [os.path.join("overrides", phase + ".md"), os.path.join("phases", phase + ".md")]
-    text = "(no instructions file for phase '%s')" % phase
-    for name in names:
-        path = name if os.path.isabs(name) else _path(root, name)
-        if os.path.exists(path):
-            with open(path, encoding="utf-8") as f:
-                text = f.read()
-            break
-    return text.replace("{spec}", state.get("spec", "")).replace("{run_dir}", _rel("run"))
+    text = _kit_text(root, phase, config["phases"].get(phase, {}).get("instructions"))
+    return _render(text if text is not None else "(no instructions file for phase '%s')" % phase, state)
+
+
+def is_delegated(config, state):
+    return state["phase"] != DONE and bool(config["phases"].get(state["phase"], {}).get("delegate"))
+
+
+def phase_brief(root, config, state):
+    """Self-contained brief for a subagent: the phase instructions plus the files it must read."""
+    files = [state.get("spec", "")]
+    names = sorted(os.listdir(run_dir(root))) if os.path.isdir(run_dir(root)) else []
+    if "plan.md" in names:
+        files.append(_rel("run", "plan.md"))
+    files += [_rel("run", n) for n in names if n.startswith("review") and n.endswith(".md")]
+    if FAILURE_FILE in names:
+        files.append(_rel("run", FAILURE_FILE))
+    return "%s\n\n## Files to read\n\nRead these files from disk first (paths are relative to the project root):\n\n%s" % (
+        phase_instructions(root, config, state).rstrip("\n"), "\n".join("- `%s`" % f for f in files))
+
+
+def phase_prompt(root, config, state):
+    """Phase instructions, wrapped in the orchestration preamble when the phase is delegated."""
+    if not is_delegated(config, state):
+        return phase_instructions(root, config, state)
+    brief = phase_brief(root, config, state)
+    preamble = _kit_text(root, "delegate")
+    return _render(preamble, state).replace("{brief}", brief) if preamble is not None else brief
+
+
+def failure_path(root):
+    return os.path.join(run_dir(root), FAILURE_FILE)
+
+
+def write_failure(root, text):
+    os.makedirs(run_dir(root), exist_ok=True)
+    with open(failure_path(root), "w", encoding="utf-8") as f:
+        f.write(text)
+
+
+def clear_failure(root):
+    if os.path.exists(failure_path(root)):
+        os.remove(failure_path(root))
 
 
 def header(state):
@@ -261,17 +308,18 @@ def check_steps_immutable(previous, current):
 # --- checks --------------------------------------------------------------------
 
 def check_phase(root, config, phase):
-    """Return (result, details) where result is 'pass', 'fail' or 'reject'."""
+    """Return (result, details, full) where result is 'pass', 'fail' or 'reject', details is truncated
+    to maxOutputChars for messages, and full is the untruncated text for run/last-failure.md."""
     check = config["phases"][phase].get("check")
     if not check:
-        return "pass", "no check configured"
+        return "pass", "no check configured", ""
     kind = check["type"]
     limit = config.get("maxOutputChars", 4000)
     if kind == "file":
         path = os.path.join(root, check["path"])
         if os.path.exists(path) and os.path.getsize(path) > 0:
-            return "pass", "%s exists" % check["path"]
-        return "fail", "Required file %s is missing or empty." % check["path"]
+            return "pass", "%s exists" % check["path"], ""
+        return _same("fail", "Required file %s is missing or empty." % check["path"])
     if kind == "command":
         try:
             proc = subprocess.run(
@@ -279,39 +327,45 @@ def check_phase(root, config, phase):
                 cwd=root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 timeout=config.get("checkTimeoutSec", 900))
         except subprocess.TimeoutExpired:
-            return "fail", "Check command timed out: %s" % check["command"]
+            return _same("fail", "Check command timed out: %s" % check["command"])
         output = proc.stdout.decode("utf-8", errors="replace")
         if proc.returncode == 0:
-            return "pass", "`%s` succeeded" % check["command"]
-        return "fail", "`%s` exited with %d:\n%s" % (check["command"], proc.returncode, tail(output, limit))
+            return "pass", "`%s` succeeded" % check["command"], ""
+        summary = "`%s` exited with %d:\n" % (check["command"], proc.returncode)
+        return "fail", summary + tail(output, limit), summary + output
     if kind == "verdict":
         path = os.path.join(root, check["path"])
         if not os.path.exists(path):
-            return "fail", "Review file %s is missing." % check["path"]
+            return _same("fail", "Review file %s is missing." % check["path"])
         with open(path, encoding="utf-8", errors="replace") as f:
             text = f.read()
         if check["approve"] in text:
-            return "pass", "review approved"
+            return "pass", "review approved", ""
         if check["reject"] in text:
-            return "reject", tail(text, limit)
-        return "fail", "%s must contain '%s' or '%s'." % (check["path"], check["approve"], check["reject"])
+            return "reject", tail(text, limit), text
+        return _same("fail", "%s must contain '%s' or '%s'." % (check["path"], check["approve"], check["reject"]))
     if kind == "steps":
         path = os.path.join(root, check["path"])
         if not os.path.exists(path):
-            return "fail", "Steps file %s is missing." % check["path"]
+            return _same("fail", "Steps file %s is missing." % check["path"])
         try:
             with open(path, encoding="utf-8") as f:
                 data = json.load(f)
         except ValueError as e:
-            return "fail", "Steps file %s is not valid JSON: %s" % (check["path"], e)
+            return _same("fail", "Steps file %s is not valid JSON: %s" % (check["path"], e))
         errors = validate_steps(data)
         if not errors and check.get("requireAllPending"):
             errors = ["%s: status must be pending, not %s" % (_step_label(i, s), s["status"])
                       for i, s in enumerate(data["steps"]) if s["status"] != "pending"]
         if errors:
-            return "fail", head("Steps file %s is invalid:\n%s" % (check["path"], "\n".join(errors)), limit)
-        return "pass", "%s is valid" % check["path"]
-    return "fail", "Unknown check type '%s'." % kind
+            full = "Steps file %s is invalid:\n%s" % (check["path"], "\n".join(errors))
+            return "fail", head(full, limit), full
+        return "pass", "%s is valid" % check["path"], ""
+    return _same("fail", "Unknown check type '%s'." % kind)
+
+
+def _same(result, details):
+    return result, details, details
 
 
 def size_limit(config, key):
@@ -365,12 +419,13 @@ def handle_stop(root, hook_input):
         return None
     config = load_config(root)
     phase = state["phase"]
-    result, details = check_phase(root, config, phase)
+    result, details, full = check_phase(root, config, phase)
     state["iter"] = state.get("iter", 0) + 1
     state.setdefault("history", []).append(
         {"phase": phase, "result": result, "at": now(), "iter": state["iter"]})
 
     if result == "pass":
+        clear_failure(root)
         next_phase = config["phases"][phase].get("next", DONE)
         state["phase"] = next_phase
         state["lastFailure"] = None
@@ -393,18 +448,30 @@ def handle_stop(root, hook_input):
                         cmd_name(config, "feature"), cmd_name(config, "go")))}
         save_state(root, state)
         return {"decision": "block", "reason": "Phase '%s' passed (%s). Now entering phase '%s'.\n\n%s" % (
-            phase, details, next_phase, phase_instructions(root, config, state))}
+            phase, details, next_phase, phase_prompt(root, config, state))}
 
+    write_failure(root, full)
+    failure_file = _rel("run", FAILURE_FILE)
     if result == "reject":
         archive_review(root, config, phase, state)
         state["phase"] = config["phases"][phase]["check"].get("onReject", "implement")
         state["lastFailure"] = "review rejected"
-        reason = "Review requested changes. Back to phase '%s'. Address every point below:\n\n%s\n\n%s" % (
-            state["phase"], details, phase_instructions(root, config, state))
+        if is_delegated(config, state):
+            reason = "Review requested changes. Back to phase '%s'. Full review: %s\n\n%s" % (
+                state["phase"], failure_file, phase_prompt(root, config, state))
+        else:
+            reason = "Review requested changes. Back to phase '%s'. Address every point below:\n\n%s\n\n%s" % (
+                state["phase"], details, phase_instructions(root, config, state))
     else:
         state["lastFailure"] = tail(details, 500)
-        reason = "Phase '%s' is not complete yet. %s\n\nKeep working on phase '%s'.\n\n%s" % (
-            phase, details, phase, phase_instructions(root, config, state))
+        if is_delegated(config, state):
+            lines = details.strip().splitlines()
+            reason = "Phase '%s' is not complete yet: %s. Full details: %s\n\n%s" % (
+                phase, lines[0].rstrip(":.") if lines else "check failed", failure_file,
+                phase_prompt(root, config, state))
+        else:
+            reason = "Phase '%s' is not complete yet. %s\n\nKeep working on phase '%s'.\n\n%s" % (
+                phase, details, phase, phase_instructions(root, config, state))
 
     if state["iter"] >= config.get("maxIterations", 15):
         state["status"] = "stalled"
@@ -458,8 +525,11 @@ def handle_context(root, event):
     status = state.get("status")
     if status == "active":
         text = header(state)
+        if is_delegated(config, state):
+            text += ("\n[specloop] Phase '%s' is delegated: start one subagent with the phase brief, relay a short "
+                     "summary, and finish your turn; do not do the phase's work yourself." % state["phase"])
         if event == "SessionStart" or state.get("iter", 0) == 0:
-            text += "\n\n" + phase_instructions(root, config, state)
+            text += "\n\n" + phase_prompt(root, config, state)
         elif state.get("lastFailure"):
             text += "\nLast check failure: " + state["lastFailure"]
     elif status == "ready":
@@ -510,7 +580,7 @@ def cmd_go(root):
         state["largePlanAcknowledged"] = True
     state["status"] = "active"
     save_state(root, state)
-    return header(state) + "\n\n" + phase_instructions(root, config, state)
+    return header(state) + "\n\n" + phase_prompt(root, config, state)
 
 
 def cmd_pause(root):
@@ -527,6 +597,7 @@ def cmd_advance(root):
     if not state or state["phase"] == DONE:
         return "Nothing to advance."
     config = load_config(root)
+    clear_failure(root)
     state.setdefault("history", []).append({"phase": state["phase"], "result": "skipped", "at": now()})
     state["phase"] = config["phases"][state["phase"]].get("next", DONE)
     if state["phase"] == DONE:

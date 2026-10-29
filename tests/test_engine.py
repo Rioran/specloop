@@ -436,6 +436,178 @@ class EngineTest(unittest.TestCase):
         self.assertIn("steps[0] (id 1)", out["reason"])
         self.assertNotIn("steps[19]", out["reason"])
 
+    # --- delegation and the failure file ------------------------------------------
+
+    def delegate(self, phase, command="exit 0", **extra):
+        phases = {"implement": {"check": {"type": "command", "command": command}}}
+        phases.setdefault(phase, {})["delegate"] = True
+        config = {"phases": phases}
+        config.update(extra)
+        self.set_config(config)
+
+    def last_failure(self):
+        path = os.path.join(self.base, "run", "last-failure.md")
+        if not os.path.exists(path):
+            return None
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+
+    def test_delegate_absent_output_is_unchanged(self):
+        for config in (None, {"phases": {"implement": {"delegate": False,
+                                                       "check": {"type": "command", "command": "exit 1"}}}}):
+            if config is None:
+                self.set_test_command("exit 1")
+            else:
+                self.set_config(config)
+            workflow.cmd_init(self.root, "spec.md")
+            state = self.state()
+            state["status"] = "active"
+            out = workflow.cmd_go(self.root)
+            cfg = workflow.load_config(self.root)
+            self.assertEqual(workflow.header(state) + "\n\n" + workflow.phase_instructions(self.root, cfg, state), out)
+            self.assertEqual(
+                workflow.header(state) + "\n\n" + workflow.phase_instructions(self.root, cfg, state),
+                workflow.handle_context(self.root, "SessionStart")["hookSpecificOutput"]["additionalContext"])
+
+            self.write_run("plan.md", "plan")
+            reason = workflow.handle_stop(self.root, {})["reason"]
+            state = self.state()
+            self.assertEqual("Phase 'plan' passed (.claude/specloop/run/plan.md exists). Now entering phase "
+                             "'implement'.\n\n" + workflow.phase_instructions(self.root, cfg, state), reason)
+
+            reason = workflow.handle_stop(self.root, {})["reason"]
+            self.assertEqual("Phase 'implement' is not complete yet. `exit 1` exited with 1:\n\n\n"
+                             "Keep working on phase 'implement'.\n\n"
+                             + workflow.phase_instructions(self.root, cfg, state), reason)
+            self.assertNotIn("delegated", workflow.handle_context(self.root, "UserPromptSubmit")
+                             ["hookSpecificOutput"]["additionalContext"])
+
+    def test_delegated_go_contains_preamble_instructions_and_files(self):
+        self.delegate("plan")
+        workflow.cmd_init(self.root, "spec.md")
+        out = workflow.cmd_go(self.root)
+        self.assertIn("phase=plan", out)
+        self.assertIn("exactly one subagent", out)
+        self.assertIn("## Phase: plan", out)
+        self.assertIn("## Files to read", out)
+        self.assertIn("- `spec.md`", out)
+        self.assertNotIn("{brief}", out)
+        self.assertNotIn("plan.md`", out.split("## Files to read")[1])
+        text = workflow.handle_context(self.root, "SessionStart")["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("exactly one subagent", text)
+        self.assertIn("## Files to read", text)
+
+    def test_delegated_stop_reason_on_pass_uses_preamble(self):
+        self.delegate("implement")
+        self.start()
+        self.write_run("plan.md", "plan")
+        reason = workflow.handle_stop(self.root, {})["reason"]
+        self.assertIn("entering phase 'implement'", reason)
+        self.assertIn("exactly one subagent", reason)
+        self.assertIn("## Phase: implement", reason)
+        self.assertIn("- `.claude/specloop/run/plan.md`", reason)
+
+    def test_delegated_fail_reason_is_short_and_points_to_failure_file(self):
+        self.delegate("implement", command="echo line-$((0+1)); echo line-$((1+1)); exit 1")
+        self.start()
+        self.write_run("plan.md", "plan")
+        workflow.handle_stop(self.root, {})
+        reason = workflow.handle_stop(self.root, {})["reason"]
+        self.assertIn("Phase 'implement' is not complete yet", reason)
+        self.assertIn("exited with 1", reason)
+        self.assertIn(".claude/specloop/run/last-failure.md", reason)
+        self.assertIn("exactly one subagent", reason)
+        self.assertNotIn("line-1", reason)
+        self.assertNotIn("line-2", reason)
+        self.assertIn("line-2", self.last_failure())
+        self.assertIn("- `.claude/specloop/run/last-failure.md`", reason)
+
+    def test_delegated_reject_reason_is_short(self):
+        self.delegate("implement")
+        self.start()
+        self.write_run("plan.md", "plan")
+        workflow.handle_stop(self.root, {})
+        workflow.handle_stop(self.root, {})
+        self.write_run("review.md", "SECRET-DETAIL fix the null check.\nVERDICT: CHANGES_REQUESTED")
+        reason = workflow.handle_stop(self.root, {})["reason"]
+        self.assertIn("Back to phase 'implement'", reason)
+        self.assertIn(".claude/specloop/run/last-failure.md", reason)
+        self.assertNotIn("SECRET-DETAIL", reason)
+        self.assertIn("- `.claude/specloop/run/review-3.md`", reason)
+        self.assertIn("exactly one subagent", reason)
+
+    def test_brief_lists_review_files_and_last_failure(self):
+        self.start()
+        state, config = self.state(), workflow.load_config(self.root)
+        brief = workflow.phase_brief(self.root, config, state)
+        self.assertNotIn("review", brief.split("## Files to read")[1])
+        self.assertNotIn("last-failure", brief)
+        self.write_run("plan.md", "plan")
+        self.write_run("review-2.md", "old")
+        self.write_run("review.md", "new")
+        self.write_run("last-failure.md", "boom")
+        files = workflow.phase_brief(self.root, config, state).split("## Files to read")[1]
+        expected = ["spec.md", ".claude/specloop/run/plan.md", ".claude/specloop/run/review-2.md",
+                    ".claude/specloop/run/review.md", ".claude/specloop/run/last-failure.md"]
+        self.assertEqual(["- `%s`" % p for p in expected], [l for l in files.splitlines() if l.startswith("- ")])
+
+    def test_delegate_override_preamble_wins(self):
+        self.write_override("delegate", "CUSTOM ORCHESTRATOR for {spec}\n{brief}")
+        self.delegate("plan")
+        workflow.cmd_init(self.root, "spec.md")
+        out = workflow.cmd_go(self.root)
+        self.assertIn("CUSTOM ORCHESTRATOR for spec.md", out)
+        self.assertNotIn("exactly one subagent", out)
+        self.assertIn("## Phase: plan", out)
+
+    def test_last_failure_written_on_failed_command_with_full_output(self):
+        self.set_config({"maxOutputChars": 50, "phases": {"implement": {"check": {
+            "type": "command", "command": "echo FIRST-$((2*3)); printf 'x%.0s' $(seq 1 200); echo; exit 2"}}}})
+        self.start()
+        self.write_run("plan.md", "plan")
+        workflow.handle_stop(self.root, {})
+        reason = workflow.handle_stop(self.root, {})["reason"]
+        self.assertNotIn("FIRST-6", reason)
+        text = self.last_failure()
+        self.assertIn("exited with 2", text)
+        self.assertIn("FIRST-6", text)
+        self.assertIn("x" * 200, text)
+
+    def test_last_failure_written_on_rejected_review(self):
+        self.start()
+        self.write_run("plan.md", "plan")
+        workflow.handle_stop(self.root, {})
+        workflow.handle_stop(self.root, {})
+        review = "Fix it.\n" + "detail " * 1000 + "\nVERDICT: CHANGES_REQUESTED"
+        self.write_run("review.md", review)
+        workflow.handle_stop(self.root, {})
+        self.assertEqual(review, self.last_failure())
+
+    def test_last_failure_removed_when_phase_passes(self):
+        self.start()
+        workflow.handle_stop(self.root, {})
+        self.assertIn("plan.md", self.last_failure())
+        self.write_run("plan.md", "plan")
+        workflow.handle_stop(self.root, {})
+        self.assertIsNone(self.last_failure())
+
+    def test_last_failure_removed_on_advance(self):
+        self.start()
+        workflow.handle_stop(self.root, {})
+        self.assertIsNotNone(self.last_failure())
+        workflow.cmd_advance(self.root)
+        self.assertIsNone(self.last_failure())
+
+    def test_delegated_context_states_orchestrator_role(self):
+        self.delegate("plan")
+        self.start()
+        workflow.handle_stop(self.root, {})
+        text = workflow.handle_context(self.root, "UserPromptSubmit")["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("Phase 'plan' is delegated", text)
+        self.assertNotIn("## Files to read", text)
+        text = workflow.handle_context(self.root, "SessionStart")["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("Phase 'plan' is delegated", text)
+
 
 def valid_steps():
     return {
