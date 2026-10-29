@@ -1,6 +1,7 @@
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -15,8 +16,15 @@ class InstallTest(unittest.TestCase):
 
     def setUp(self):
         self.root = tempfile.mkdtemp()
+        # Keep git from discovering a repository above the temp directory.
+        self.ceiling = os.environ.get("GIT_CEILING_DIRECTORIES")
+        os.environ["GIT_CEILING_DIRECTORIES"] = os.path.dirname(self.root)
 
     def tearDown(self):
+        if self.ceiling is None:
+            os.environ.pop("GIT_CEILING_DIRECTORIES", None)
+        else:
+            os.environ["GIT_CEILING_DIRECTORIES"] = self.ceiling
         shutil.rmtree(self.root, ignore_errors=True)
 
     def path(self, *parts):
@@ -94,14 +102,63 @@ class InstallTest(unittest.TestCase):
         local = self.read_json(".claude", "settings.local.json")
         self.assertEqual(1, len(self.specloop_groups(local, "Stop")))
 
-    def test_gitignore_entries_added_once(self):
+    def git_init(self):
+        if not shutil.which("git"):
+            self.skipTest("git not available")
+        subprocess.run(["git", "init", "-q"], cwd=self.root, check=True)
+
+    def read_gitignore(self):
+        with open(self.path(".gitignore"), encoding="utf-8") as f:
+            return f.read()
+
+    def git_check_ignore(self, rel):
+        return subprocess.run(["git", "check-ignore", "-q", rel], cwd=self.root).returncode == 0
+
+    def test_gitignore_ignores_kit_but_not_project_files(self):
+        self.git_init()
+        install.install(self.root, test_command="true")
+        for rel in (".claude/specloop/engine.py", ".claude/specloop/phases/plan.md",
+                    ".claude/specloop/state.json", ".claude/specloop/run/x", ".claude/commands/sl-go.md"):
+            self.assertTrue(self.git_check_ignore(rel), rel)
+        for rel in (".claude/specloop/config.json", ".claude/specloop/overrides/plan.md",
+                    ".claude/settings.json", ".claude/commands/mine.md"):
+            self.assertFalse(self.git_check_ignore(rel), rel)
+
+    def test_gitignore_block_written_once_and_follows_prefix(self):
+        self.git_init()
         self.write(".gitignore", "node_modules/")
         install.install(self.root, test_command="true")
-        install.install(self.root, test_command="true")
-        with open(self.path(".gitignore")) as f:
-            text = f.read()
+        install.install(self.root, prefix="x-")
+        text = self.read_gitignore()
         self.assertTrue(text.startswith("node_modules/\n"))
-        self.assertEqual(1, text.count(".claude/specloop/state.json"))
+        self.assertEqual(1, text.count(install.GITIGNORE_BEGIN))
+        self.assertIn(".claude/commands/x-go.md", text)
+        self.assertNotIn(".claude/commands/sl-go.md", text)
+
+    def test_gitignore_replaces_legacy_runtime_entries(self):
+        self.git_init()
+        self.write(".gitignore", "build/\n\n# specloop runtime state\n"
+                                 ".claude/specloop/state.json\n.claude/specloop/run/\n")
+        install.install(self.root, test_command="true")
+        text = self.read_gitignore()
+        self.assertNotIn("# specloop runtime state", text)
+        self.assertTrue(text.startswith("build/\n\n" + install.GITIGNORE_BEGIN))
+
+    def test_gitignore_untouched_outside_git(self):
+        install.install(self.root, test_command="true")
+        self.assertFalse(os.path.exists(self.path(".gitignore")))
+
+    def test_no_gitignore_option_skips_gitignore(self):
+        self.git_init()
+        install.install(self.root, test_command="true", gitignore=False)
+        self.assertFalse(os.path.exists(self.path(".gitignore")))
+
+    def test_uninstall_removes_gitignore_block(self):
+        self.git_init()
+        self.write(".gitignore", "node_modules/\n")
+        install.install(self.root, test_command="true")
+        install.uninstall(self.root)
+        self.assertEqual("node_modules/\n", self.read_gitignore())
 
     def test_uninstall_removes_everything_but_foreign_settings(self):
         self.write(".claude/settings.json", json.dumps({"model": "opus"}))

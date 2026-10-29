@@ -22,8 +22,11 @@ BASE_DIR = os.path.join(".claude", "specloop")
 HOOK_MARKER = ".claude/specloop/run.sh"
 RUN = 'sh "$CLAUDE_PROJECT_DIR/.claude/specloop/run.sh"'
 SHIPPED = ["engine.py", "run.sh", "defaults.json", "phases"]
-GITIGNORE_LINES = [".claude/specloop/state.json", ".claude/specloop/run/"]
-GITIGNORE_HEADER = "# specloop runtime state"
+GITIGNORE_BEGIN = "# >>> specloop (managed by install.py; config.json and overrides/ stay tracked)"
+GITIGNORE_END = "# <<< specloop"
+GITIGNORE_KIT = [".claude/specloop/*", "!.claude/specloop/config.json", "!.claude/specloop/overrides/"]
+# Written by versions before 0.2.0; dropped when the managed block is written.
+LEGACY_GITIGNORE = ["# specloop runtime state", ".claude/specloop/state.json", ".claude/specloop/run/"]
 NO_TESTS_HINT = "No test command detected; set phases.implement.check in .claude/specloop/config.json."
 
 
@@ -170,28 +173,59 @@ def install_commands(target, prefix):
     return installed
 
 
-def git_ignored(target, rel):
+def in_git_work_tree(target):
     try:
-        return subprocess.run(["git", "check-ignore", "-q", rel], cwd=target,
-                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+        result = subprocess.run(["git", "rev-parse", "--is-inside-work-tree"], cwd=target,
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, universal_newlines=True)
     except OSError:
         return False
+    return result.returncode == 0 and result.stdout.strip() == "true"
 
 
-def update_gitignore(target):
-    missing = [line for line in GITIGNORE_LINES if not git_ignored(target, line)]
+def gitignore_writable(path):
+    if os.path.exists(path):
+        return os.path.isfile(path) and os.access(path, os.R_OK | os.W_OK)
+    return os.access(os.path.dirname(path), os.W_OK)
+
+
+def strip_gitignore_block(lines):
+    kept, inside = [], False
+    for line in lines:
+        if line == GITIGNORE_BEGIN:
+            inside = True
+        elif inside:
+            inside = line != GITIGNORE_END
+        elif line not in LEGACY_GITIGNORE:
+            kept.append(line)
+    while kept and not kept[-1].strip():
+        kept.pop()
+    return kept
+
+
+def write_gitignore(target, block):
+    """Replace specloop's managed block in .gitignore; an empty block removes it."""
     path = os.path.join(target, ".gitignore")
-    existing = ""
+    if not in_git_work_tree(target) or not gitignore_writable(path):
+        return False
+    existing = []
     if os.path.exists(path):
         with open(path, encoding="utf-8") as f:
-            existing = f.read()
-    missing = [line for line in missing if line not in existing.splitlines()]
-    if not missing:
-        return
-    with open(path, "a", encoding="utf-8", newline="\n") as f:
-        if existing and not existing.endswith("\n"):
-            f.write("\n")
-        f.write("\n%s\n%s\n" % (GITIGNORE_HEADER, "\n".join(missing)))
+            existing = f.read().splitlines()
+    lines = strip_gitignore_block(existing)
+    if block:
+        lines += ([""] if lines else []) + [GITIGNORE_BEGIN] + block + [GITIGNORE_END]
+    if lines == existing:
+        return True
+    if not lines and not os.path.exists(path):
+        return True
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.write("\n".join(lines) + "\n" if lines else "")
+    return True
+
+
+def update_gitignore(target, commands):
+    if not write_gitignore(target, GITIGNORE_KIT + commands):
+        print("! .gitignore not updated: %s is not in a git work tree or .gitignore is not writable." % target)
 
 
 def install(target, scope="project", prefix=None, test_command=None, force=False, gitignore=True):
@@ -208,12 +242,13 @@ def install(target, scope="project", prefix=None, test_command=None, force=False
     write_json(chosen, merge_hooks(read_json(chosen), stop_timeout))
     write_json(manifest_path(target), {"commands": commands, "settings": os.path.relpath(chosen, target)})
     if gitignore:
-        update_gitignore(target)
+        update_gitignore(target, commands)
     return prefix
 
 
 def uninstall(target, keep_config=False):
     remove_commands(target)
+    write_gitignore(target, [])
     for path in settings_files(target):
         if os.path.exists(path):
             write_json(path, strip_hooks(read_json(path)))

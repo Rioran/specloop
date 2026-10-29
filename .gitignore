@@ -1,3 +1,6 @@
 __pycache__/
 *.pyc
 .pytest_cache/
+
+# specloop installed into this repository for testing; generated from kit/
+.claude/

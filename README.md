@@ -41,7 +41,7 @@ Safety valves:
 Clone once, then install into as many projects as you like:
 
 ```bash
-git clone <this-repo-url> ~/tools/specloop
+git clone https://github.com/ba3a/specloop.git ~/tools/specloop
 ~/tools/specloop/install.sh ~/code/my-project
 ```
 
@@ -58,7 +58,7 @@ The installer:
 - creates `config.json` and tries to detect the test command (Gradle, Maven, npm, pytest, Go, Cargo, .NET);
 - installs the slash commands into `.claude/commands/`;
 - merges the hooks into `.claude/settings.json` and leaves your other settings and hooks alone;
-- adds the runtime state (`state.json`, `run/`) to `.gitignore`.
+- if the project is in a git work tree and `.gitignore` is writable, keeps a marked `# >>> specloop` block in `.gitignore`. The block ignores the installed kit, the runtime state and the installed slash commands. `config.json` and `overrides/` stay tracked so the team can share them. Re-running the installer rewrites the block, and `--uninstall` removes it.
 
 ### Installer options
 
@@ -101,7 +101,9 @@ Files in `<project>/.claude/specloop/`:
 | `config.json` | **project** | Your overrides, deep-merged over `defaults.json`. |
 | `phases/<phase>.md` | kit (replaced on update) | Shipped phase instructions. |
 | `overrides/<phase>.md` | **project** | Your phase instructions; take precedence over `phases/`. |
-| `state.json`, `run/` | runtime (git-ignored) | Current state, plan and review files. |
+| `state.json`, `run/` | runtime | Current state, plan and review files. |
+
+Everything in this directory except `config.json` and `overrides/` is git-ignored.
 
 `config.json` example:
 
