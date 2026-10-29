@@ -123,6 +123,21 @@ Everything in this directory except `config.json` and `overrides/` is git-ignore
 }
 ```
 
+Top-level keys (the `feature` block is described under [Feature mode](#feature-mode)):
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `commandPrefix` | `"sl-"` | Prefix of the slash commands, as set by the installer's `--prefix`. Used in every message the engine prints. |
+| `initialPhase` | `"plan"` | First phase of a single-mode run. |
+| `maxIterations` | `15` | Blocked stops per phase (per step in feature mode) before the run goes to `stalled`. |
+| `checkTimeoutSec` | `900` | Timeout for a `command` check. |
+| `maxOutputChars` | `4000` | Check output and review text are truncated to this many characters in stop messages (`run/last-failure.md` keeps everything). |
+| `shell` | `"bash"` | Shell that runs `command` checks (Git Bash on Windows). |
+| `blockedCommandsUntilDone` | `git push`, `gh pr create`, `gh pr merge` | Bash commands denied while a run is active, in both modes. |
+| `largeSpecWarning` | `maxLines` 200, `maxWords` 2000, `maxPlanItems` 12 | Single-mode size warnings; see [Large specs and plans](#large-specs-and-plans). |
+| `phases` | `plan` → `implement` → `review` | The single-mode phase graph; see below. |
+| `feature` | see [Feature mode](#feature-mode) | Feature-mode settings and phase graphs. |
+
 ### Phase graph
 
 Each phase has `next` (a phase name or `done`), an optional `allowEdits` list of path prefixes (omit it to allow all edits), an optional `instructions` file, and an optional `check`:
@@ -193,6 +208,21 @@ For features too big for one plan → implement → review cycle, load the spec 
 /sl-go                             approve the plan; step 1: implement -> review -> (rework ...) -> commit
                                    step 2: ... until the last step is committed -> done
 ```
+
+End to end: `/sl-feature` loads the spec → the first `/sl-go` creates the branch and a planning subagent writes `run/plan.md` and `run/steps.json` → you review and edit the plan, and `/sl-go` approves it → every step runs implement → review in fresh subagents, and the engine commits it → after the last step the run is `done` and you get a list of the commits to review and open a pull request from. `/sl-status` shows the progress at any time.
+
+**Single mode or feature mode?**
+
+| | Single mode (`/sl-spec`) | Feature mode (`/sl-feature`) |
+|-|--------------------------|------------------------------|
+| Good for | A change that fits one reviewable commit | A feature that needs several commits |
+| Result | One uncommitted diff for you to commit | A branch with one commit per step |
+| Plan | `run/plan.md` (free text) | `run/plan.md` plus `run/steps.json`, approved by you |
+| Review | Once, over the whole change | Per step, over that step's diff |
+| Context | One session does everything (delegation optional) | Each phase runs in a fresh subagent by default |
+| Git | Untouched; you commit | Needs a clean git work tree; the engine owns the branch and commits |
+
+The [size warnings](#large-specs-and-plans) suggest feature mode when a single-mode spec or plan gets large.
 
 **Branch.** The first `/sl-go` of a feature run creates and checks out `feature.branchPrefix` + a slug of the spec's first `# ` heading (or its file name): lowercase ASCII, `-` separators, at most 50 characters. If that branch exists, `-2`, `-3`, … is appended. It refuses, without changing anything, when the directory is not a git repository, the repository has no commits, `HEAD` is detached, or tracked files have uncommitted changes (staged or not; changes under `.claude/specloop/` are ignored). State records `branch`, `baseRef` (the starting commit) and `preexistingUntracked` (untracked files that existed at start). Later `/sl-go` calls refuse if the current branch is not the run's branch.
 
@@ -267,6 +297,7 @@ The single-mode size warnings do not apply in feature mode.
 | `feature.replan` | `"stall"` | What a `run/replan.md` request does: `"stall"` for the user, or `"auto"` to run the replan phase. |
 | `feature.replanPhase` | `"feature-replan"` | Phase (in `feature.planPhases`) that rewrites the remaining steps in `"auto"` mode. |
 | `feature.maxReplans` | `3` | Auto-replans allowed per run; later requests stall. |
+| `feature.enforceDelegation` | `false` | In delegated phases, deny the main session's edit tools outside `run/` (see [Hacks and limitations](#hacks-and-limitations)). |
 | `feature.blockedCommands` | `git commit`, `checkout`, `switch`, `reset`, `rebase`, `merge`, `stash`, `branch -D`, `push` | Bash commands denied while a feature run is active. |
 
 ## Tips
@@ -281,6 +312,11 @@ The single-mode size warnings do not apply in feature mode.
 - **Delegation is instruction-only and not guaranteed.** Hooks cannot start subagents, so `delegate: true` only *tells* the main session to hand the phase to a subagent. It may do the work itself anyway, for example after context compaction or when it judges the phase to be small. The gates still protect the result either way; only the fresh-context benefit is lost.
   - *How to notice:* in a delegated phase, the main session reads source files, edits files or runs the tests itself instead of starting one subagent.
   - *How to recover:* run `/sl-pause`, then `/clear`, then `/sl-go`. `/sl-go` re-sends the orchestrator instructions with the phase brief to a clean context.
+- **`feature.enforceDelegation` can block, not force.** Claude Code adds `agent_id` (and `agent_type`) to hook input when a tool call comes from inside a subagent, and leaves them out for the main conversation ([hooks reference](https://code.claude.com/docs/en/hooks), "Common input fields"). With `enforceDelegation: true`, PreToolUse uses that to deny the main session's `Edit`, `Write`, `MultiEdit` and `NotebookEdit` calls outside `.claude/specloop/run/` in any delegated phase, and tells it to start a subagent. Subagent calls are never affected. Limits:
+  - it cannot make the main session start a subagent; it only stops it from editing source files itself;
+  - read-only phases such as review (and planning), which already edit only `run/`, cannot be forced into a subagent at all: the main session can still read the code and write the review itself;
+  - edits made through Bash (for example `sed -i` or `>` redirects) are not covered;
+  - `agent_type` alone is not trusted, because it is also present in the main conversation of a session started with `--agent`; in-process teammates carry an `agent_id` and are treated like subagents.
 
 ## Uninstall
 

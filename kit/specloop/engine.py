@@ -977,6 +977,11 @@ def handle_pretool(root, hook_input):
         if allowed is not None and (rel is None or not any(rel.startswith(p) for p in allowed)):
             return deny("phase '%s' only allows editing %s, not %s." % (
                 phase, ", ".join(allowed), rel or "a path outside the project"))
+        # Claude Code sets agent_id in hook input only for tool calls made inside a subagent.
+        if (config["feature"].get("enforceDelegation") and is_delegated(config, state)
+                and not hook_input.get("agent_id") and not (rel or "").startswith(_rel("run") + "/")):
+            return deny("phase '%s' is delegated: start one subagent with the phase brief and let it make this "
+                        "edit. The main session may only edit %s/." % (phase, _rel("run")))
 
     if tool == "Bash":
         command = tool_input.get("command", "")

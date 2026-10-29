@@ -14,9 +14,14 @@ VERSION                               kit version, copied into targets
 kit/specloop/engine.py                state machine: hook handlers + manual commands
 kit/specloop/run.sh                   portable launcher used by hooks and commands (finds Python)
 kit/specloop/defaults.json            default config and phase graph (replaced on update)
-kit/specloop/phases/*.md              shipped phase instructions (replaced on update)
+kit/specloop/phases/*.md              shipped phase instructions (replaced on update):
+  plan.md, implement.md, review.md      single-mode phases
+  feature-plan.md, feature-replan.md    feature-mode planning and replanning
+  step-implement.md, step-review.md     feature-mode step cycle
+  delegate.md                           orchestration preamble for delegated phases ({brief})
 kit/commands/*.md                     slash command templates; {{prefix}} is substituted on install
-tests/                                unittest suites for the engine and the installer
+                                      (spec, feature, go, pause, advance, status, reset)
+tests/                                unittest suites for the engine, the installer and the docs
 ```
 
 Installed layout in a target: `.claude/specloop/{engine.py,run.sh,defaults.json,phases/,VERSION,manifest.json}` belong to the kit. `config.json` and `overrides/` belong to the project. `state.json` and `run/` are runtime state.

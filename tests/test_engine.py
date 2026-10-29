@@ -226,6 +226,16 @@ class EngineTest(unittest.TestCase):
         self.assertIsNone(workflow.handle_pretool(
             self.root, {"tool_name": "Bash", "tool_input": {"command": "git checkout main"}}))
 
+    def test_enforce_delegation_applies_to_delegated_single_mode_phase(self):
+        self.set_config({"feature": {"enforceDelegation": True},
+                         "phases": {"implement": {"delegate": True, "check": None}}})
+        self.start()
+        workflow.cmd_advance(self.root)
+        src = {"tool_name": "Edit", "tool_input": {"file_path": os.path.join(self.root, "src", "Main.java")}}
+        out = workflow.handle_pretool(self.root, src)
+        self.assertEqual("deny", out["hookSpecificOutput"]["permissionDecision"])
+        self.assertIsNone(workflow.handle_pretool(self.root, dict(src, agent_id="a1")))
+
     def test_single_mode_status_is_json(self):
         self.start()
         self.assertEqual(self.state(), json.loads(workflow.cmd_status(self.root)))
@@ -1542,6 +1552,93 @@ class FeatureModeTest(unittest.TestCase):
         self.assertIn(".claude/specloop/run/replan.md", self.approve())
         self.write("a.py", "a = 1\n")
         self.assertIn(".claude/specloop/run/replan.md", workflow.handle_stop(self.root, {})["reason"])
+
+    # --- delegation enforcement --------------------------------------------------
+
+    def edit(self, rel, tool="Edit", agent_id=None, agent_type=None):
+        key = "notebook_path" if tool == "NotebookEdit" else "file_path"
+        hook_input = {"tool_name": tool, "tool_input": {key: os.path.join(self.root, rel)}}
+        if agent_id:
+            hook_input["agent_id"] = agent_id
+        if agent_type:
+            hook_input["agent_type"] = agent_type
+        out = workflow.handle_pretool(self.root, hook_input)
+        return out["hookSpecificOutput"]["permissionDecisionReason"] if out else None
+
+    def test_enforce_delegation_denies_main_session_edits(self):
+        self.approve(feature={"enforceDelegation": True})
+        for tool in ("Edit", "Write", "MultiEdit", "NotebookEdit"):
+            reason = self.edit(os.path.join("src", "x.py"), tool=tool)
+            self.assertIsNotNone(reason, tool)
+            self.assertIn("subagent", reason)
+
+    def test_enforce_delegation_allows_subagent_and_run_dir(self):
+        self.approve(feature={"enforceDelegation": True})
+        self.assertIsNone(self.edit(os.path.join("src", "x.py"), agent_id="agent-1", agent_type="general-purpose"))
+        self.assertIsNone(self.edit(os.path.join(".claude", "specloop", "run", "notes.md")))
+        self.assertIsNotNone(self.edit(os.path.join("src", "x.py"), agent_type="my-agent"))
+
+    def test_enforce_delegation_off_by_default_and_ignores_non_delegated_phases(self):
+        self.approve()
+        self.assertIsNone(self.edit(os.path.join("src", "x.py")))
+        workflow.cmd_reset(self.root)
+        self.git("checkout", "-q", self.start_branch)
+        self.approve(feature={"enforceDelegation": True, "stepPhases": {"implement": {"delegate": False}}})
+        self.assertIsNone(self.edit(os.path.join("src", "x.py")))
+
+    def test_enforce_delegation_does_not_block_bash(self):
+        self.approve(feature={"enforceDelegation": True})
+        self.assertIsNone(self.bash("sed -i s/a/b/ src/x.py"))
+
+    # --- end to end ----------------------------------------------------------------
+
+    def main(self, *argv, stdin=""):
+        import contextlib
+        import io
+        old_stdin, sys.stdin = sys.stdin, io.StringIO(stdin)
+        os.environ["CLAUDE_PROJECT_DIR"] = self.root
+        out = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(0, workflow.main(list(argv)))
+        finally:
+            sys.stdin = old_stdin
+            del os.environ["CLAUDE_PROJECT_DIR"]
+        return out.getvalue()
+
+    def stop(self):
+        out = self.main("stop", stdin="{}")
+        return json.loads(out) if out.strip() else None
+
+    def test_end_to_end_feature_run_through_entry_points(self):
+        self.set_config({"phases": {"implement": {"check": {"type": "command", "command": "exit 0"}}}})
+        base = self.git("rev-parse", "HEAD")
+        self.assertIn("feature mode", self.main("init-feature", "spec.md"))
+        self.assertIn("feature planning", self.main("go"))
+        self.assertEqual("specloop/my-big-feature", self.current_branch())
+
+        self.write_run("plan.md", "# Plan\n")
+        self.write_run("steps.json", json.dumps(self.two_steps()))
+        self.assertIn("/sl-go", self.stop()["systemMessage"])
+        self.assertIn('feature step 1/2 "Add steps.json schema validation"', self.main("go"))
+
+        for name in ("a.py", "b.md"):
+            self.write(name, "content of %s\n" % name)
+            self.assertIn("entering phase 'review'", self.stop()["reason"])
+            self.write_run("review.md", "Fine.\nVERDICT: APPROVE\n")
+            final = self.stop()
+
+        self.assertIn("All 2 steps are finished on branch specloop/my-big-feature", final["systemMessage"])
+        self.assertEqual("specloop/my-big-feature", self.current_branch())
+        self.assertEqual(["docs: Document it", "feat: Add steps.json schema validation"],
+                         self.git("log", "--format=%s", base + "..HEAD").splitlines())
+        status = self.main("status")
+        self.assertIn("[specloop] feature run, status=done", status)
+        self.assertIn("steps (2/2 done):", status)
+        for sha in self.git("rev-list", base + "..HEAD").splitlines():
+            self.assertIn(sha[:7], status)
+        self.assertEqual("done", self.state()["status"])
+        self.assertIsNone(self.stop())
 
     def test_replan_file_ignored_during_planning(self):
         self.start()
