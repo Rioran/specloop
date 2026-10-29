@@ -43,6 +43,9 @@ FAILURE_FILE = "last-failure.md"
 COMMIT = "commit"
 REPLAN_FILE = "replan.md"
 MAX_SLUG_LENGTH = 50
+VERDICT_PREFIX = "#>-*+ \t"  # Markdown heading, quote and list markers before a verdict
+VERDICT_WRAP = " \t`*_."  # whitespace, emphasis and a trailing period around a verdict
+CODE_FENCE = ("```", "~~~")
 
 
 def project_dir(hook_input=None):
@@ -388,18 +391,30 @@ def check_steps_immutable(previous, current):
 
 # --- checks --------------------------------------------------------------------
 
+def verdict_line(line):
+    """Reduce a review line (or a configured marker) to its bare text: "- `VERDICT: APPROVE`." -> "VERDICT: APPROVE"."""
+    return line.strip().lstrip(VERDICT_PREFIX).strip(VERDICT_WRAP)
+
+
 def find_verdict(text, check):
     """Return 'pass', 'reject' or None from the verdict lines of a review.
 
-    A verdict line is a whole line equal to check["approve"] or check["reject"], ignoring surrounding
-    whitespace and Markdown emphasis. The last one wins, so a review that quotes both markers while
-    discussing them does not pass by accident, and a reviewer who changes their mind is read correctly."""
-    verdict = None
+    A verdict line is a whole line whose bare text (see verdict_line) equals check["approve"] or the
+    optional check["reject"]; lines inside fenced code blocks are skipped. So a marker quoted inside a
+    sentence or a code block never counts. The last verdict line wins, so a reviewer who changes their
+    mind is read correctly."""
+    approve, reject = verdict_line(check["approve"]), verdict_line(check.get("reject") or "")
+    verdict, fenced = None, False
     for line in text.splitlines():
-        line = line.strip().strip("`*_").strip()
-        if line == check["approve"]:
+        if line.lstrip().startswith(CODE_FENCE):
+            fenced = not fenced
+            continue
+        line = verdict_line(line)
+        if fenced:
+            continue
+        if line == approve:
             verdict = "pass"
-        elif line == check["reject"]:
+        elif reject and line == reject:
             verdict = "reject"
     return verdict
 
@@ -436,15 +451,16 @@ def check_phase(root, config, phase_config):
         path = os.path.join(root, check["path"])
         if not os.path.exists(path):
             return _same("fail", "Review file %s is missing." % check["path"])
-        with open(path, encoding="utf-8", errors="replace") as f:
+        with open(path, encoding="utf-8-sig", errors="replace") as f:
             text = f.read()
         verdict = find_verdict(text, check)
         if verdict == "pass":
             return "pass", "review approved", ""
         if verdict == "reject":
             return "reject", tail(text, limit), text
-        return _same("fail", "%s must contain a verdict line: exactly '%s' or '%s' on a line of its own." % (
-            check["path"], check["approve"], check["reject"]))
+        markers = " or ".join("'%s'" % m for m in (check["approve"], check.get("reject")) if m)
+        return _same("fail", "%s must contain a verdict line: exactly %s on a line of its own." % (
+            check["path"], markers))
     if kind == "steps":
         path = os.path.join(root, check["path"])
         if not os.path.exists(path):

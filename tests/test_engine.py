@@ -148,8 +148,18 @@ class EngineTest(unittest.TestCase):
         self.assertEqual("implement", self.state()["phase"])
         self.assertIn("second thought", out["reason"])
 
+    def test_last_verdict_line_wins_for_approve_too(self):
+        out = self.review("VERDICT: CHANGES_REQUESTED\n\nRe-read: the test is there.\n\nVERDICT: APPROVE\n")
+        self.assertNotIn("decision", out)
+        self.assertEqual("done", self.state()["status"])
+
     def test_verdict_line_may_carry_markdown_emphasis(self):
         out = self.review("All good.\n\n  **`VERDICT: APPROVE`**  \n")
+        self.assertNotIn("decision", out)
+        self.assertEqual("done", self.state()["status"])
+
+    def test_verdict_file_with_bom_is_read(self):
+        out = self.review("﻿VERDICT: APPROVE\n")
         self.assertNotIn("decision", out)
         self.assertEqual("done", self.state()["status"])
 
@@ -682,6 +692,44 @@ def valid_steps():
             },
         ],
     }
+
+
+class VerdictTest(unittest.TestCase):
+
+    CHECK = {"approve": "VERDICT: APPROVE", "reject": "VERDICT: CHANGES_REQUESTED"}
+
+    def verdict(self, text, check=None):
+        return workflow.find_verdict(text, check or self.CHECK)
+
+    def test_decorated_verdict_lines_count(self):
+        for line in ("- `VERDICT: APPROVE`", "## VERDICT: APPROVE", "> VERDICT: APPROVE", "VERDICT: APPROVE.",
+                     "**VERDICT: APPROVE**.", "** `VERDICT: APPROVE` **", "\tVERDICT: APPROVE \r"):
+            self.assertEqual("pass", self.verdict("Notes.\n" + line + "\n"), line)
+
+    def test_verdict_with_other_text_on_the_line_does_not_count(self):
+        for line in ("Final: VERDICT: APPROVE", "VERDICT: APPROVE if the test is added", "VERDICT:APPROVE",
+                     "verdict: approve", "~~VERDICT: APPROVE~~"):
+            self.assertIsNone(self.verdict(line + "\n"), line)
+
+    def test_verdict_inside_code_fence_is_ignored(self):
+        text = "VERDICT: CHANGES_REQUESTED\n\nEnd your file like this:\n```\nVERDICT: APPROVE\n```\n"
+        self.assertEqual("reject", self.verdict(text))
+        self.assertIsNone(self.verdict("~~~md\nVERDICT: APPROVE\n~~~\n"))
+
+    def test_custom_markers_are_normalized_like_lines(self):
+        check = {"approve": "**LGTM**", "reject": "`NOPE`"}
+        self.assertEqual("pass", self.verdict("**LGTM**\n", check))
+        self.assertEqual("pass", self.verdict("LGTM\n", check))
+        self.assertEqual("reject", self.verdict("- NOPE\n", check))
+
+    def test_reject_marker_is_optional(self):
+        check = {"approve": "LGTM"}
+        self.assertEqual("pass", self.verdict("LGTM\n", check))
+        self.assertIsNone(self.verdict("NOPE\n", check))
+
+    def test_reject_marker_containing_approve_marker_rejects(self):
+        check = {"approve": "LGTM", "reject": "LGTM-NOT"}
+        self.assertEqual("reject", self.verdict("LGTM-NOT\n", check))
 
 
 class StepsValidationTest(unittest.TestCase):
