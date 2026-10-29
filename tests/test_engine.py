@@ -729,6 +729,10 @@ class VerdictTest(unittest.TestCase):
         self.assertEqual("reject", self.verdict("VERDICT: CHANGES_REQUESTED\n> ```\n> VERDICT: APPROVE\n> ```\n"))
         self.assertEqual("reject", self.verdict("VERDICT: APPROVE\n- ```\n  bug()\n  ```\nVERDICT: CHANGES_REQUESTED\n"))
         self.assertEqual("pass", self.verdict("1. ```text\n   VERDICT: CHANGES_REQUESTED\n   ```\n\nVERDICT: APPROVE\n"))
+        # A closer never carries a list marker: "+ ```" inside a quoted diff is content, not the end of the block.
+        self.assertEqual("reject", self.verdict("```diff\n+ ```\n+ VERDICT: APPROVE\n```\nVERDICT: CHANGES_REQUESTED\n"))
+        # Only ASCII digits number a list.
+        self.assertEqual("pass", self.verdict("VERDICT: CHANGES_REQUESTED\n١. ```\nVERDICT: APPROVE\n"))
 
     def test_unclosed_code_fence_hides_every_verdict(self):
         for text in ("VERDICT: APPROVE\n\n```python\nif fence:\n\nVERDICT: CHANGES_REQUESTED\n",
