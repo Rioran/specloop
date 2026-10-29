@@ -18,7 +18,30 @@
         "allowEdits": [".claude/specloop/run/"],
         "check": { "type": "steps", "path": ".claude/specloop/run/steps.json", "requireAllPending": true }
       }
-    }
+    },
+    "stepInitialPhase": "implement",
+    "stepPhases": {
+      "implement": {
+        "delegate": true,
+        "next": "review",
+        "check": null
+      },
+      "review": {
+        "delegate": true,
+        "next": "commit",
+        "allowEdits": [".claude/specloop/run/"],
+        "check": {
+          "type": "verdict",
+          "path": ".claude/specloop/run/review.md",
+          "approve": "VERDICT: APPROVE",
+          "reject": "VERDICT: CHANGES_REQUESTED",
+          "onReject": "implement"
+        }
+      }
+    },
+    "commitExclude": [".claude/specloop/"],
+    "commitMessage": "{type}: {step_title}\n\nspecloop step {step_index}/{step_count} ({step_id}) of {spec}",
+    "pauseBetweenSteps": false
   },
   "phases": {
     "plan": {

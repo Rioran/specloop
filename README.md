@@ -185,14 +185,13 @@ Set a key to `null` to disable that check, or the whole block to disable all of 
 
 ## Feature mode
 
-For features too big for one plan → implement → review cycle, load the spec with `/sl-feature` instead of `/sl-spec`. A planning subagent splits the spec into small ordered steps, and each step is meant to end in one commit on a dedicated branch.
-
-> **Status:** branch creation, planning and plan approval are available. Running and committing the steps is **coming soon**: approving a plan currently stores it and reports that step execution is not available yet.
+For features too big for one plan → implement → review cycle, load the spec with `/sl-feature` instead of `/sl-spec`. A planning subagent splits the spec into small ordered steps. Each step then runs through its own implement → review cycle and ends in one commit on a dedicated branch.
 
 ```
 /sl-feature specs/big-feature.md   load the spec in feature mode (Claude summarizes it)
 /sl-go                             create the feature branch, run the planning phase, pause for approval
-/sl-go                             approve the plan (re-validates run/steps.json)
+/sl-go                             approve the plan; step 1: implement -> review -> (rework ...) -> commit
+                                   step 2: ... until the last step is committed -> done
 ```
 
 **Branch.** The first `/sl-go` of a feature run creates and checks out `feature.branchPrefix` + a slug of the spec's first `# ` heading (or its file name): lowercase ASCII, `-` separators, at most 50 characters. If that branch exists, `-2`, `-3`, … is appended. It refuses, without changing anything, when the directory is not a git repository, the repository has no commits, `HEAD` is detached, or tracked files have uncommitted changes (staged or not; changes under `.claude/specloop/` are ignored). State records `branch`, `baseRef` (the starting commit) and `preexistingUntracked` (untracked files that existed at start). Later `/sl-go` calls refuse if the current branch is not the run's branch.
@@ -211,7 +210,21 @@ For features too big for one plan → implement → review cycle, load the spec 
 
 Edits are restricted to `.claude/specloop/run/`. The gate passes when `steps.json` parses, matches the schema and every step is `pending`; otherwise the errors are written to `run/last-failure.md` and the subagent keeps working.
 
-**Approval.** When the plan passes its gate, the run pauses. Review or edit `run/plan.md` and `run/steps.json`, then run `/sl-go`: it validates `steps.json` again (refusing with the errors if it is invalid) and stores the approved copy in state as `approvedSteps`.
+**Approval.** When the plan passes its gate, the run pauses. Review or edit `run/plan.md` and `run/steps.json`, then run `/sl-go`: it validates `steps.json` again (refusing with the errors if it is invalid), stores the approved copy in state as `approvedSteps`, and starts step 1.
+
+**Step cycle.** Each step runs through `feature.stepPhases`, starting at `feature.stepInitialPhase`. The default cycle mirrors single mode: `implement` (delegated, no edit restriction, checked with your test command from `phases.implement.check`), then `review` (delegated, edits limited to `run/`, verdict on `run/review.md`; `CHANGES_REQUESTED` goes back to `implement`). A step phase without a `check` reuses the check of the top-level phase with the same name. You can add phases (for example a per-step `lint`) or remove one with `null`, as in the top-level graph. Instructions come from `phases/step-<phase>.md` (`step-implement.md`, `step-review.md`), overridable in `overrides/`, with these placeholders on top of `{spec}` and `{run_dir}`: `{step_index}` (1-based), `{step_count}`, `{step_id}`, `{step_title}`, `{step_description}`, `{step_acceptance}` (a bullet list) and `{steps_file}`. `maxIterations` applies per step.
+
+When a step starts, the engine marks it `active`, resets the iteration counter, and moves the previous step's `run/review*.md` and `run/last-failure.md` into `run/steps/<id>/`. Status and commit changes are written both to `run/steps.json` and to `approvedSteps`.
+
+**Commits.** `commit` is a reserved pseudo-phase at the end of the step cycle (the default `review.next`). When a step reaches it, the Stop hook:
+
+1. runs `git add -A`, then unstages everything under `feature.commitExclude` and every `preexistingUntracked` path;
+2. if nothing is staged, marks the step `empty` (no commit, a warning in history) and moves on;
+3. otherwise commits with `feature.commitMessage` (never `--no-verify`), stores the SHA in the step's `commit`, marks it `done`, and starts the next step.
+
+If the commit fails (for example a pre-commit hook rejects it), the step goes back to `feature.stepInitialPhase` with the output in `run/last-failure.md` and in the stop reason; the attempt counts as an iteration. `/sl-advance` force-passes the current step phase; advancing out of the last one commits the step rather than skipping it. With `feature.pauseBetweenSteps`, the run pauses after each commit until `/sl-go`.
+
+**Completion.** After the last step, the run is `done` and the final message lists every step as `<short sha> <title>` (or `(empty)`) with the branch name. Review the branch and open a pull request yourself: specloop never pushes, and `/sl-reset` never deletes the branch or its commits.
 
 The single-mode size warnings do not apply in feature mode.
 
@@ -222,6 +235,11 @@ The single-mode size warnings do not apply in feature mode.
 | `feature.requirePlanApproval` | `true` | Pause for approval after planning. When `false`, the plan is approved as soon as its gate passes. |
 | `feature.gitTimeoutSec` | `60` | Timeout for every git call the engine makes. |
 | `feature.planPhases` | `feature-plan` phase | Phase graph for planning, with the same keys as `phases` (`delegate`, `allowEdits`, `check`, `instructions`). |
+| `feature.stepInitialPhase` | `"implement"` | First phase of every step. |
+| `feature.stepPhases` | `implement` → `review` → `commit` | Phase graph of the step cycle; `commit` is the reserved terminal pseudo-phase. |
+| `feature.commitExclude` | `[".claude/specloop/"]` | Paths never included in step commits. |
+| `feature.commitMessage` | `"{type}: {step_title}\n\nspecloop step {step_index}/{step_count} ({step_id}) of {spec}"` | Commit message template; `{type}` is the step's `type` (default `feat`). |
+| `feature.pauseBetweenSteps` | `false` | Pause after each step's commit. |
 
 ## Tips
 

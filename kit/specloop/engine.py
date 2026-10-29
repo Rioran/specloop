@@ -40,6 +40,7 @@ LOCKED_STATUSES = ("done", "empty")
 COMMIT_TYPES = ("feat", "fix", "refactor", "test", "docs", "chore", "perf", "build", "ci", "style")
 MAX_TITLE_LENGTH = 72
 FAILURE_FILE = "last-failure.md"
+COMMIT = "commit"
 MAX_SLUG_LENGTH = 50
 
 
@@ -85,6 +86,12 @@ def load_config(root):
         config["feature"] = {}
     feature = config["feature"]
     feature["planPhases"] = {k: v for k, v in (feature.get("planPhases") or {}).items() if v}
+    steps = {k: v for k, v in (feature.get("stepPhases") or {}).items() if v}
+    for name, phase in steps.items():
+        # A step phase without a check reuses the top-level phase's check (the project's test command).
+        if not phase.get("check") and config["phases"].get(name, {}).get("check"):
+            steps[name] = dict(phase, check=config["phases"][name]["check"])
+    feature["stepPhases"] = steps
     return config
 
 
@@ -92,9 +99,41 @@ def is_feature(state):
     return (state or {}).get("mode", "single") == "feature"
 
 
+def in_step(state):
+    return is_feature(state) and state.get("stepId") is not None
+
+
 def phase_graph(config, state):
-    """The phase graph the current run uses: `phases` in single mode, `feature.planPhases` in feature mode."""
-    return config["feature"]["planPhases"] if is_feature(state) else config["phases"]
+    """The phase graph the current run uses: `phases` in single mode; in feature mode
+    `feature.planPhases` while planning and `feature.stepPhases` while a step is active."""
+    if not is_feature(state):
+        return config["phases"]
+    return config["feature"]["stepPhases"] if in_step(state) else config["feature"]["planPhases"]
+
+
+def current_step(state):
+    """Return (index, step) of the active step in approvedSteps, or (None, None)."""
+    for index, step in enumerate((state.get("approvedSteps") or {}).get("steps", [])):
+        if step.get("id") == state.get("stepId"):
+            return index, step
+    return None, None
+
+
+def step_values(state):
+    """Placeholder values for the active step; empty when no step is active."""
+    index, step = current_step(state) if in_step(state) else (None, None)
+    if step is None:
+        return {}
+    return {
+        "step_index": str(index + 1),
+        "step_count": str(len(state["approvedSteps"]["steps"])),
+        "step_id": str(step["id"]),
+        "step_title": step["title"],
+        "step_description": step["description"],
+        "step_acceptance": "\n".join("- " + a for a in step["acceptance"]),
+        "steps_file": _rel("run", "steps.json"),
+        "type": step.get("type", "feat"),
+    }
 
 
 def load_state(root):
@@ -135,14 +174,21 @@ def _kit_text(root, name, custom=None):
 
 
 def _render(text, state):
-    return text.replace("{spec}", state.get("spec", "")).replace("{run_dir}", _rel("run"))
+    """Fill {spec}, {run_dir} and, while a step is active, the step placeholders, in a single pass."""
+    values = dict(step_values(state), spec=state.get("spec", ""), run_dir=_rel("run"))
+    return re.sub(r"\{(\w+)\}", lambda m: values.get(m.group(1), m.group(0)), text)
 
 
 def phase_instructions(root, config, state):
     phase = state["phase"]
     if phase == DONE:
         return "The workflow is complete."
-    text = _kit_text(root, phase, phase_graph(config, state).get(phase, {}).get("instructions"))
+    custom = phase_graph(config, state).get(phase, {}).get("instructions")
+    text = None
+    if in_step(state):
+        text = _kit_text(root, "step-" + phase, custom)
+    if text is None:
+        text = _kit_text(root, phase, custom)
     return _render(text if text is not None else "(no instructions file for phase '%s')" % phase, state)
 
 
@@ -156,6 +202,8 @@ def phase_brief(root, config, state):
     names = sorted(os.listdir(run_dir(root))) if os.path.isdir(run_dir(root)) else []
     if "plan.md" in names:
         files.append(_rel("run", "plan.md"))
+    if is_feature(state) and "steps.json" in names:
+        files.append(_rel("run", "steps.json"))
     files += [_rel("run", n) for n in names if n.startswith("review") and n.endswith(".md")]
     if FAILURE_FILE in names:
         files.append(_rel("run", FAILURE_FILE))
@@ -525,18 +573,136 @@ def check_feature_branch(root, config, state):
 
 
 def approve_plan(root, config, state):
-    """Validate run/steps.json again and store it as approvedSteps. Return the message for the user."""
-    plan_config = phase_graph(config, state).get(config["feature"].get("planPhase", "feature-plan"), {})
+    """Validate run/steps.json again, store it as approvedSteps and start step 1.
+
+    Return an error message (nothing saved) when the plan is invalid, else None."""
+    plan_config = config["feature"]["planPhases"].get(config["feature"].get("planPhase", "feature-plan"), {})
     result, _, full = check_phase(root, config, plan_config)
     if result != "pass":
         return "The plan cannot be approved yet:\n%s\n\nFix it, then run %s again." % (full, cmd_name(config, "go"))
     with open(os.path.join(root, plan_config["check"]["path"]), encoding="utf-8") as f:
         state["approvedSteps"] = json.load(f)
-    # Until step execution exists, every later go repeats this approval instead of re-entering planning.
-    state.update(status="paused", awaitingApproval=True)
+    state.pop("awaitingApproval", None)
+    state["status"] = "active"
+    start_next_step(root, config, state)
     save_state(root, state)
-    return ("Plan approved: %d steps stored. Step execution is not available yet in this version of specloop, "
-            "so the run stays paused." % len(state["approvedSteps"]["steps"]))
+    return None
+
+
+def save_steps(root, state):
+    """Write approvedSteps (including engine-owned status/commit changes) back to run/steps.json."""
+    with open(os.path.join(run_dir(root), "steps.json"), "w", encoding="utf-8") as f:
+        json.dump(state["approvedSteps"], f, indent=2)
+        f.write("\n")
+
+
+def archive_step_files(root, step_id):
+    """Move the finished step's review*.md and last-failure.md into run/steps/<id>/."""
+    names = [n for n in os.listdir(run_dir(root))
+             if (n.startswith("review") and n.endswith(".md")) or n == FAILURE_FILE]
+    if not names:
+        return
+    dest = os.path.join(run_dir(root), "steps", str(step_id))
+    os.makedirs(dest, exist_ok=True)
+    for name in names:
+        os.replace(os.path.join(run_dir(root), name), os.path.join(dest, name))
+
+
+def start_next_step(root, config, state):
+    """Archive the previous step's files and make the next pending step active. Return it, or None."""
+    if state.get("stepId") is not None:
+        archive_step_files(root, state["stepId"])
+    step = next((s for s in state["approvedSteps"]["steps"] if s.get("status") == "pending"), None)
+    if step is None:
+        state["stepId"] = None
+        return None
+    step["status"] = "active"
+    state.update(stepId=step["id"], phase=config["feature"].get("stepInitialPhase", "implement"),
+                 iter=0, lastFailure=None)
+    save_steps(root, state)
+    return step
+
+
+def step_label(state):
+    index, step = current_step(state)
+    return "Step %d/%d" % (index + 1, len(state["approvedSteps"]["steps"])), step
+
+
+def _matches(path, prefixes):
+    return any(path == p.rstrip("/") or path.startswith(p.rstrip("/") + "/") for p in prefixes)
+
+
+def commit_step(root, config, state):
+    """Stage and commit the current step. Return ('committed', sha), ('empty', None) or ('failed', output)."""
+    ok, top = git(root, config, "rev-parse", "--show-toplevel")
+    if not ok:
+        return "failed", "git rev-parse --show-toplevel failed:\n" + top
+    ok, prefix = git(root, config, "rev-parse", "--show-prefix")
+    if not ok:
+        return "failed", "git rev-parse --show-prefix failed:\n" + prefix
+    ok, out = git(top, config, "add", "-A")
+    if not ok:
+        return "failed", "git add -A failed:\n" + out
+    ok, out = git(top, config, "diff", "--cached", "--name-only", "-z", raw=True)
+    if not ok:
+        return "failed", "git diff --cached failed:\n" + out
+    excluded = [prefix + p for p in config["feature"].get("commitExclude", [])]
+    preexisting = set(state.get("preexistingUntracked", []))
+    unstage = [p for p in out.split("\0") if p and (p in preexisting or _matches(p, excluded))]
+    for start in range(0, len(unstage), 100):
+        ok, out = git(top, config, "reset", "-q", "--", *unstage[start:start + 100])
+        if not ok:
+            return "failed", "git reset failed:\n" + out
+    if git(top, config, "diff", "--cached", "--quiet")[0]:
+        return "empty", None
+    message = _render(config["feature"].get("commitMessage", "{type}: {step_title}"), state)
+    ok, out = git(top, config, "commit", "-q", "-m", message)
+    if not ok:
+        return "failed", "git commit failed:\n" + out
+    ok, sha = git(top, config, "rev-parse", "HEAD")
+    return ("committed", sha) if ok else ("failed", "git rev-parse HEAD failed:\n" + sha)
+
+
+def completion_message(config, state):
+    lines = ["%s %s" % (s["commit"][:7] if s.get("commit") else "(empty)", s["title"])
+             for s in state["approvedSteps"]["steps"]]
+    return ("All %d steps are finished on branch %s:\n%s\n\nReview the branch (git log --oneline %s..%s) "
+            "and open a pull request when it is ready; specloop never pushes." % (
+                len(lines), state.get("branch"), "\n".join("  " + l for l in lines),
+                (state.get("baseRef") or "")[:7], state.get("branch")))
+
+
+def finish_step(root, config, state):
+    """Commit the current step and start the next one.
+
+    Return (kind, text): 'failed' (text is the git output, the step is back in stepInitialPhase),
+    'next' (text summarizes the commit; the next step is active), 'paused' or 'done' (text is the message)."""
+    label, step = step_label(state)
+    result, value = commit_step(root, config, state)
+    if result == "failed":
+        state["phase"] = config["feature"].get("stepInitialPhase", "implement")
+        state["lastFailure"] = tail(value, 500)
+        write_failure(root, value)
+        return "failed", value
+    if result == "empty":
+        step["status"] = "empty"
+        state.setdefault("history", []).append({"phase": COMMIT, "result": "empty", "at": now(), "warning": (
+            "step %s had no changes; nothing was committed" % step["id"])})
+        summary = "%s \"%s\" had no changes; nothing was committed." % (label, step["title"])
+    else:
+        step.update(status="done", commit=value)
+        state["history"].append({"phase": COMMIT, "result": "committed", "at": now(), "commit": value})
+        summary = "%s committed (%s): %s." % (label, value[:7], step["title"])
+    clear_failure(root)
+    save_steps(root, state)
+    if start_next_step(root, config, state) is None:
+        state.update(status="done", phase=DONE)
+        return "done", summary + "\n\n" + completion_message(config, state)
+    if config["feature"].get("pauseBetweenSteps"):
+        state["status"] = "paused"
+        return "paused", "%s Paused before %s. Run %s to continue." % (
+            summary, step_label(state)[0].lower(), cmd_name(config, "go"))
+    return "next", summary
 
 
 def await_approval(root, config, state):
@@ -564,11 +730,17 @@ def handle_stop(root, hook_input):
     if result == "pass":
         clear_failure(root)
         state["lastFailure"] = None
-        if is_feature(state) and phase == config["feature"].get("planPhase"):
+        if is_feature(state) and not in_step(state) and phase == config["feature"].get("planPhase"):
             if config["feature"].get("requirePlanApproval", True):
                 return {"systemMessage": "[specloop] " + await_approval(root, config, state)}
-            return {"systemMessage": "[specloop] " + approve_plan(root, config, state)}
+            error = approve_plan(root, config, state)
+            if error:
+                return {"systemMessage": "[specloop] " + error}
+            return {"decision": "block", "reason": "Plan approved. %s starts now.\n\n%s" % (
+                step_label(state)[0], phase_prompt(root, config, state))}
         next_phase = graph[phase].get("next", DONE)
+        if in_step(state) and next_phase in (COMMIT, DONE):
+            return step_finished(root, config, state, phase)
         state["phase"] = next_phase
         if next_phase == DONE:
             state["status"] = "done"
@@ -614,7 +786,11 @@ def handle_stop(root, hook_input):
         else:
             reason = "Phase '%s' is not complete yet. %s\n\nKeep working on phase '%s'.\n\n%s" % (
                 phase, details, phase, phase_instructions(root, config, state))
+    return block_or_stall(root, config, state, phase, reason)
 
+
+def block_or_stall(root, config, state, phase, reason):
+    """Block the stop with `reason`, or stall when the iteration limit is reached."""
     if state["iter"] >= config.get("maxIterations", 15):
         state["status"] = "stalled"
         save_state(root, state)
@@ -623,6 +799,30 @@ def handle_stop(root, hook_input):
                                      state["iter"], phase, cmd_name(config, "go"), cmd_name(config, "advance"))}
     save_state(root, state)
     return {"decision": "block", "reason": reason}
+
+
+def commit_failed_reason(config, root, state, label, output):
+    if is_delegated(config, state):
+        lines = output.strip().splitlines()
+        return "Committing %s failed: %s. Full details: %s\n\n%s" % (
+            label.lower(), lines[0].rstrip(":.") if lines else "git failed", _rel("run", FAILURE_FILE),
+            phase_prompt(root, config, state))
+    return "Committing %s failed. Back to phase '%s'. Fix the problem below:\n\n%s\n\n%s" % (
+        label.lower(), state["phase"], tail(output, config.get("maxOutputChars", 4000)),
+        phase_instructions(root, config, state))
+
+
+def step_finished(root, config, state, phase):
+    """The last phase of the step cycle passed: commit the step and continue (Stop hook result)."""
+    label = step_label(state)[0]
+    kind, text = finish_step(root, config, state)
+    if kind == "failed":
+        return block_or_stall(root, config, state, phase, commit_failed_reason(config, root, state, label, text))
+    save_state(root, state)
+    if kind in ("done", "paused"):
+        return {"systemMessage": "[specloop] " + text}
+    return {"decision": "block", "reason": "%s Now starting %s.\n\n%s" % (
+        text, step_label(state)[0].lower(), phase_prompt(root, config, state))}
 
 
 def deny(reason):
@@ -720,7 +920,9 @@ def cmd_go(root):
         if error:
             return "Not started: %s" % error
         if state["status"] == "paused" and state.get("awaitingApproval"):
-            return approve_plan(root, config, state)
+            error = approve_plan(root, config, state)
+            if error:
+                return error
     elif state["status"] == "ready" and not state.get("largeSpecAcknowledged"):
         warning = spec_size_warning(root, config, state.get("spec", ""))
         if warning and not state.get("largeSpecWarned"):
@@ -755,9 +957,22 @@ def cmd_advance(root):
     config = load_config(root)
     clear_failure(root)
     state.setdefault("history", []).append({"phase": state["phase"], "result": "skipped", "at": now()})
-    if is_feature(state) and state["phase"] == config["feature"].get("planPhase"):
+    if is_feature(state) and not in_step(state) and state["phase"] == config["feature"].get("planPhase"):
         return await_approval(root, config, state)
-    state["phase"] = phase_graph(config, state)[state["phase"]].get("next", DONE)
+    next_phase = phase_graph(config, state)[state["phase"]].get("next", DONE)
+    if in_step(state) and next_phase in (COMMIT, DONE):
+        # Advancing out of the last step phase commits the step; it never skips the commit.
+        label = step_label(state)[0]
+        state["iter"] = state.get("iter", 0) + 1
+        kind, text = finish_step(root, config, state)
+        save_state(root, state)
+        if kind == "failed":
+            return "Committing %s failed; the step is back in phase '%s'.\n\n%s" % (
+                label.lower(), state["phase"], tail(text, config.get("maxOutputChars", 4000)))
+        if kind == "next":
+            return "%s Now in %s, phase '%s'." % (text, step_label(state)[0].lower(), state["phase"])
+        return text
+    state["phase"] = next_phase
     if state["phase"] == DONE:
         state["status"] = "done"
     save_state(root, state)
