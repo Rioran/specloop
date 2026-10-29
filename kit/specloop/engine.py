@@ -45,7 +45,7 @@ REPLAN_FILE = "replan.md"
 MAX_SLUG_LENGTH = 50
 VERDICT_PREFIX = re.compile(r"^(?:\s|>|#+(?=\s)|[-+*](?=\s))+")  # Markdown quote, heading and list markers
 VERDICT_WRAP = " \t`*_."  # whitespace, emphasis and a trailing period around a verdict
-CODE_FENCE = re.compile(r"[ \t>]*(`{3,}|~{3,})(.*)$")  # fence run and its info string
+CODE_FENCE = re.compile(r"(?:[ \t>]|[-+*](?=[ \t])|\d{1,9}[.)](?=[ \t]))*(`{3,}|~{3,})(.*)$")  # fence run, info string
 
 
 def project_dir(hook_input=None):
@@ -430,7 +430,7 @@ def find_verdict(text, check):
             verdict = "pass"
         elif reject and line == reject:
             verdict = "reject"
-    return verdict
+    return None if fence else verdict  # an unclosed fence hid the rest of the file: never trust an earlier verdict
 
 
 def check_phase(root, config, phase_config):

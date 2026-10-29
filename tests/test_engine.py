@@ -723,9 +723,18 @@ class VerdictTest(unittest.TestCase):
         self.assertEqual("reject", self.verdict("VERDICT: CHANGES_REQUESTED\n````md\n" + quoted + "````\n"))
         self.assertEqual("reject", self.verdict("VERDICT: CHANGES_REQUESTED\n~~~md\n" + quoted + "~~~\n"))
         self.assertEqual("pass", self.verdict("VERDICT: CHANGES_REQUESTED\n```\n~~~\n```\nVERDICT: APPROVE\n"))
-        # Inline code at the start of a line is not a fence; a fence inside a blockquote is one.
+        self.assertIsNone(self.verdict("```\n``` y\nVERDICT: APPROVE\n```\n"))
+        # Inline code at the start of a line is not a fence; a fence inside a blockquote or a list item is one.
         self.assertEqual("reject", self.verdict("```x``` is wrong.\n" + quoted + "VERDICT: CHANGES_REQUESTED\n"))
         self.assertEqual("reject", self.verdict("VERDICT: CHANGES_REQUESTED\n> ```\n> VERDICT: APPROVE\n> ```\n"))
+        self.assertEqual("reject", self.verdict("VERDICT: APPROVE\n- ```\n  bug()\n  ```\nVERDICT: CHANGES_REQUESTED\n"))
+        self.assertEqual("pass", self.verdict("1. ```text\n   VERDICT: CHANGES_REQUESTED\n   ```\n\nVERDICT: APPROVE\n"))
+
+    def test_unclosed_code_fence_hides_every_verdict(self):
+        for text in ("VERDICT: APPROVE\n\n```python\nif fence:\n\nVERDICT: CHANGES_REQUESTED\n",
+                     "VERDICT: APPROVE\n\n> ```python\n> if fence:\n\nVERDICT: CHANGES_REQUESTED\n",
+                     "Fix:\n```python\nx = 1\n\nVERDICT: CHANGES_REQUESTED\n"):
+            self.assertIsNone(self.verdict(text), text)
 
     def test_custom_markers_are_normalized_like_lines(self):
         check = {"approve": "**LGTM**", "reject": "`NOPE`"}
@@ -738,6 +747,8 @@ class VerdictTest(unittest.TestCase):
         self.assertEqual("reject", self.verdict("Missing test.\n-1\n", check))
         self.assertEqual("pass", self.verdict("+1\n", check))
         self.assertIsNone(self.verdict("1.\n", check))
+        self.assertIsNone(self.verdict("-1\n", {"approve": "+1", "reject": "NOPE"}))
+        self.assertEqual("reject", self.verdict("APPROVED.\n", {"approve": "APPROVED", "reject": "APPROVED."}))
         self.assertEqual("reject", self.verdict("NO\n\nmore\n", {"approve": "**", "reject": "NO"}))
 
     def test_reject_marker_is_optional(self):
