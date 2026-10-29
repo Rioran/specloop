@@ -22,6 +22,7 @@ Set SPECLOOP_DISABLED=1 to turn every hook into a no-op.
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -30,6 +31,7 @@ from datetime import datetime, timezone
 BASE_DIR = os.path.join(".claude", "specloop")
 EDIT_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
 DONE = "done"
+CHECKLIST_ITEM = re.compile(r"^\s*- \[[ x]\]", re.IGNORECASE | re.MULTILINE)
 
 
 def project_dir(hook_input=None):
@@ -190,6 +192,42 @@ def check_phase(root, config, phase):
     return "fail", "Unknown check type '%s'." % kind
 
 
+def size_limit(config, key):
+    """Return a largeSpecWarning limit, or None when the block or the key is disabled or not an integer."""
+    limits = config.get("largeSpecWarning")
+    value = limits.get(key) if isinstance(limits, dict) else None
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def spec_size_warning(root, config, spec):
+    """Return a warning when the spec is too big for single mode, else None."""
+    max_lines, max_words = size_limit(config, "maxLines"), size_limit(config, "maxWords")
+    if max_lines is None and max_words is None:
+        return None
+    try:
+        with open(os.path.join(root, spec), encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except OSError:
+        return None
+    lines, words = len(text.splitlines()), len(text.split())
+    if not ((max_lines is not None and lines > max_lines) or (max_words is not None and words > max_words)):
+        return None
+    limits = " / ".join(s for s in (
+        "%d lines" % max_lines if max_lines is not None else None,
+        "%d words" % max_words if max_words is not None else None) if s)
+    return ("Warning: the spec has %d lines and %d words, above the single-mode limit of %s. "
+            "It may be too big for one plan -> implement -> review cycle; "
+            "consider %s for multi-commit features." % (lines, words, limits, cmd_name(config, "feature")))
+
+
+def count_plan_items(root):
+    try:
+        with open(os.path.join(run_dir(root), "plan.md"), encoding="utf-8", errors="replace") as f:
+            return len(CHECKLIST_ITEM.findall(f.read()))
+    except OSError:
+        return 0
+
+
 def archive_review(root, config, phase, state):
     src = os.path.join(root, config["phases"][phase]["check"]["path"])
     if os.path.exists(src):
@@ -218,6 +256,19 @@ def handle_stop(root, hook_input):
             state["status"] = "done"
             save_state(root, state)
             return {"systemMessage": "[specloop] all phases passed - done."}
+        max_items = size_limit(config, "maxPlanItems")
+        if phase == "plan" and max_items is not None and not state.get("largePlanAcknowledged"):
+            items = count_plan_items(root)
+            if items > max_items:
+                state["status"] = "paused"
+                state["largePlanItems"] = items
+                save_state(root, state)
+                return {"systemMessage": (
+                    "[specloop] the plan has %d checklist items, above the single-mode limit of %d. "
+                    "Paused before phase '%s'. Run %s and then %s to split the work into commits, "
+                    "or %s to continue anyway." % (
+                        items, max_items, next_phase, cmd_name(config, "reset"),
+                        cmd_name(config, "feature"), cmd_name(config, "go")))}
         save_state(root, state)
         return {"decision": "block", "reason": "Phase '%s' passed (%s). Now entering phase '%s'.\n\n%s" % (
             phase, details, next_phase, phase_instructions(root, config, state))}
@@ -303,10 +354,15 @@ def cmd_init(root, spec):
     config = load_config(root)
     if not spec or not os.path.exists(os.path.join(root, spec)):
         return "Spec file not found: %r" % spec
-    os.makedirs(run_dir(root), exist_ok=True)
+    # Stale plan.md / review.md from an earlier run would pass the new run's gates.
+    if os.path.isdir(run_dir(root)):
+        shutil.rmtree(run_dir(root))
+    os.makedirs(run_dir(root))
     save_state(root, {"status": "ready", "phase": config.get("initialPhase", "plan"),
                       "spec": spec.replace("\\", "/"), "iter": 0, "history": [], "createdAt": now()})
-    return "Spec loaded: %s. Run %s to start development." % (spec, cmd_name(config, "go"))
+    out = "Spec loaded: %s. Run %s to start development." % (spec, cmd_name(config, "go"))
+    warning = spec_size_warning(root, config, spec)
+    return out + "\n\n" + warning if warning else out
 
 
 def cmd_go(root):
@@ -317,8 +373,19 @@ def cmd_go(root):
     if state["status"] == "done":
         return "Workflow already done. Run %s and %s to start a new one." % (
             cmd_name(config, "reset"), cmd_name(config, "spec"))
+    if state["status"] == "ready" and not state.get("largeSpecAcknowledged"):
+        warning = spec_size_warning(root, config, state.get("spec", ""))
+        if warning and not state.get("largeSpecWarned"):
+            state["largeSpecWarned"] = True
+            save_state(root, state)
+            return ("%s\n\nThe workflow has not started. Do not plan or implement; show this warning to the user "
+                    "and wait. Running %s again proceeds in single mode anyway." % (warning, cmd_name(config, "go")))
+        if warning:
+            state["largeSpecAcknowledged"] = True
     if state["status"] == "stalled":
         state["iter"] = 0
+    if state["status"] == "paused" and state.get("largePlanItems") and not state.get("largePlanAcknowledged"):
+        state["largePlanAcknowledged"] = True
     state["status"] = "active"
     save_state(root, state)
     return header(state) + "\n\n" + phase_instructions(root, config, state)

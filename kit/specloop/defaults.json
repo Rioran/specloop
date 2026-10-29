@@ -6,6 +6,7 @@
   "maxOutputChars": 4000,
   "shell": "bash",
   "blockedCommandsUntilDone": ["git push", "gh pr create", "gh pr merge"],
+  "largeSpecWarning": { "maxLines": 200, "maxWords": 2000, "maxPlanItems": 12 },
   "phases": {
     "plan": {
       "next": "implement",
