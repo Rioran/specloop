@@ -7,6 +7,19 @@
   "shell": "bash",
   "blockedCommandsUntilDone": ["git push", "gh pr create", "gh pr merge"],
   "largeSpecWarning": { "maxLines": 200, "maxWords": 2000, "maxPlanItems": 12 },
+  "feature": {
+    "branchPrefix": "specloop/",
+    "planPhase": "feature-plan",
+    "requirePlanApproval": true,
+    "gitTimeoutSec": 60,
+    "planPhases": {
+      "feature-plan": {
+        "delegate": true,
+        "allowEdits": [".claude/specloop/run/"],
+        "check": { "type": "steps", "path": ".claude/specloop/run/steps.json", "requireAllPending": true }
+      }
+    }
+  },
   "phases": {
     "plan": {
       "next": "implement",

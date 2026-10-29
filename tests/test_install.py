@@ -57,6 +57,15 @@ class InstallTest(unittest.TestCase):
         config = self.read_json(".claude", "specloop", "config.json")
         self.assertEqual("make test", config["phases"]["implement"]["check"]["command"])
 
+    def test_feature_command_installed_with_prefix(self):
+        install.install(self.root, test_command="make test")
+        with open(self.path(".claude", "commands", "sl-feature.md"), encoding="utf-8") as f:
+            feature = f.read()
+        self.assertIn("run.sh init-feature", feature)
+        self.assertIn("/sl-go", feature)
+        self.assertNotIn("{{prefix}}", feature)
+        self.assertTrue(os.path.exists(self.path(".claude", "specloop", "phases", "feature-plan.md")))
+
     def test_no_subagent_stop_hook_installed(self):
         install.install(self.root, test_command="make test")
         self.assertTrue(os.path.exists(self.path(".claude", "specloop", "phases", "delegate.md")))

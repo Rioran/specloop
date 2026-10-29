@@ -8,6 +8,8 @@ Hook entry points (read hook JSON from stdin):
 
 Manual commands (used by slash commands):
     engine.py init <spec-path>   load a specification, status -> ready
+    engine.py init-feature <spec-path>
+                                 load a specification in feature mode (multi-commit workflow)
     engine.py go                 start (or resume) the workflow
     engine.py pause              stop driving the session, keep the phase
     engine.py advance            force-pass the current phase
@@ -26,6 +28,7 @@ import re
 import shutil
 import subprocess
 import sys
+import unicodedata
 from datetime import datetime, timezone
 
 BASE_DIR = os.path.join(".claude", "specloop")
@@ -37,6 +40,7 @@ LOCKED_STATUSES = ("done", "empty")
 COMMIT_TYPES = ("feat", "fix", "refactor", "test", "docs", "chore", "perf", "build", "ci", "style")
 MAX_TITLE_LENGTH = 72
 FAILURE_FILE = "last-failure.md"
+MAX_SLUG_LENGTH = 50
 
 
 def project_dir(hook_input=None):
@@ -77,7 +81,20 @@ def load_config(root):
     config = deep_merge(_read_json(_path(root, "defaults.json")), _read_json(_path(root, "config.json")))
     # Phases explicitly set to null in config.json are removed.
     config["phases"] = {k: v for k, v in config.get("phases", {}).items() if v}
+    if not isinstance(config.get("feature"), dict):
+        config["feature"] = {}
+    feature = config["feature"]
+    feature["planPhases"] = {k: v for k, v in (feature.get("planPhases") or {}).items() if v}
     return config
+
+
+def is_feature(state):
+    return (state or {}).get("mode", "single") == "feature"
+
+
+def phase_graph(config, state):
+    """The phase graph the current run uses: `phases` in single mode, `feature.planPhases` in feature mode."""
+    return config["feature"]["planPhases"] if is_feature(state) else config["phases"]
 
 
 def load_state(root):
@@ -125,12 +142,12 @@ def phase_instructions(root, config, state):
     phase = state["phase"]
     if phase == DONE:
         return "The workflow is complete."
-    text = _kit_text(root, phase, config["phases"].get(phase, {}).get("instructions"))
+    text = _kit_text(root, phase, phase_graph(config, state).get(phase, {}).get("instructions"))
     return _render(text if text is not None else "(no instructions file for phase '%s')" % phase, state)
 
 
 def is_delegated(config, state):
-    return state["phase"] != DONE and bool(config["phases"].get(state["phase"], {}).get("delegate"))
+    return state["phase"] != DONE and bool(phase_graph(config, state).get(state["phase"], {}).get("delegate"))
 
 
 def phase_brief(root, config, state):
@@ -307,10 +324,12 @@ def check_steps_immutable(previous, current):
 
 # --- checks --------------------------------------------------------------------
 
-def check_phase(root, config, phase):
-    """Return (result, details, full) where result is 'pass', 'fail' or 'reject', details is truncated
+def check_phase(root, config, phase_config):
+    """Run the check of one phase (its config dict from the phase graph).
+
+    Return (result, details, full) where result is 'pass', 'fail' or 'reject', details is truncated
     to maxOutputChars for messages, and full is the untruncated text for run/last-failure.md."""
-    check = config["phases"][phase].get("check")
+    check = phase_config.get("check")
     if not check:
         return "pass", "no check configured", ""
     kind = check["type"]
@@ -404,11 +423,128 @@ def count_plan_items(root):
         return 0
 
 
-def archive_review(root, config, phase, state):
-    src = os.path.join(root, config["phases"][phase]["check"]["path"])
+def archive_review(root, phase_config, state):
+    src = os.path.join(root, phase_config["check"]["path"])
     if os.path.exists(src):
         base, ext = os.path.splitext(src)
         os.replace(src, "%s-%d%s" % (base, state.get("iter", 0), ext))
+
+
+# --- feature mode ----------------------------------------------------------------
+
+def git(root, config, *args, raw=False):
+    """Run git with feature.gitTimeoutSec. Return (ok, output); never raises."""
+    try:
+        proc = subprocess.run(["git"] + list(args), cwd=root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                              timeout=config.get("feature", {}).get("gitTimeoutSec", 60))
+    except subprocess.TimeoutExpired:
+        return False, "git %s timed out" % " ".join(args)
+    except OSError as e:
+        return False, "git could not be run: %s" % e
+    output = proc.stdout.decode("utf-8", errors="replace")
+    return proc.returncode == 0, output if raw else output.strip()
+
+
+def _slugify(text):
+    ascii_text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii").lower()
+    return re.sub(r"[^a-z0-9]+", "-", ascii_text).strip("-")[:MAX_SLUG_LENGTH].strip("-")
+
+
+def branch_slug(spec_text, spec_path):
+    """Slug for the feature branch: the spec's first '# ' heading, else its file name, else 'feature'."""
+    heading = next((line[2:] for line in spec_text.splitlines() if line.startswith("# ")), "")
+    name = os.path.splitext(os.path.basename(spec_path.replace("\\", "/")))[0]
+    return _slugify(heading) or _slugify(name) or "feature"
+
+
+def _git_status(root, config):
+    """Return (ok, error, entries) with entries as (code, path) from `git status --porcelain -z`."""
+    ok, out = git(root, config, "status", "--porcelain", "-z", "--untracked-files=all", raw=True)
+    if not ok:
+        return False, out.strip(), []
+    parts, entries, i = out.split("\0"), [], 0
+    while i < len(parts):
+        entry = parts[i]
+        i += 1
+        if len(entry) < 4:
+            continue
+        if entry[0] in "RC":
+            i += 1  # renames and copies are followed by the original path
+        entries.append((entry[:2], entry[3:]))
+    return True, None, entries
+
+
+def start_feature_branch(root, config, state):
+    """Create and check out the feature branch. Return an error message (state untouched) or None."""
+    ok, out = git(root, config, "rev-parse", "--is-inside-work-tree")
+    if not ok or out != "true":
+        return "%s is not a git repository (%s)." % (root, out or "git rev-parse failed")
+    ok, base = git(root, config, "rev-parse", "--verify", "HEAD")
+    if not ok:
+        return "the repository has no commits yet (%s)." % base
+    ok, out = git(root, config, "symbolic-ref", "-q", "--short", "HEAD")
+    if not ok:
+        return "HEAD is detached. Check out a branch first."
+    ok, prefix = git(root, config, "rev-parse", "--show-prefix")
+    if not ok:
+        return "git rev-parse --show-prefix failed: %s" % prefix
+    own_dir = prefix + _rel() + "/"
+    ok, error, entries = _git_status(root, config)
+    if not ok:
+        return "git status failed: %s" % error
+    dirty = [p for code, p in entries if code != "??" and not p.startswith(own_dir)]
+    if dirty:
+        shown = ", ".join(dirty[:10]) + (" (and %d more)" % (len(dirty) - 10) if len(dirty) > 10 else "")
+        return "there are uncommitted changes to tracked files: %s. Commit or stash them first." % shown
+    untracked = sorted(p for code, p in entries if code == "??" and not p.startswith(own_dir))
+    try:
+        with open(os.path.join(root, state.get("spec", "")), encoding="utf-8", errors="replace") as f:
+            spec_text = f.read()
+    except OSError:
+        spec_text = ""
+    feature = config["feature"]
+    name = stem = feature.get("branchPrefix", "specloop/") + branch_slug(spec_text, state.get("spec", ""))
+    suffix = 2
+    while git(root, config, "rev-parse", "--verify", "--quiet", "refs/heads/" + name)[0]:
+        name, suffix = "%s-%d" % (stem, suffix), suffix + 1
+    ok, out = git(root, config, "checkout", "-q", "-b", name)
+    if not ok:
+        return "could not create branch %s: %s" % (name, out)
+    state.update(branch=name, baseRef=base, preexistingUntracked=untracked)
+    return None
+
+
+def check_feature_branch(root, config, state):
+    """Return an error message when the current branch is not the run's branch, else None."""
+    ok, current = git(root, config, "symbolic-ref", "-q", "--short", "HEAD")
+    if ok and current == state["branch"]:
+        return None
+    return "this feature run works on branch %s, but the current branch is %s. Run `git checkout %s` first." % (
+        state["branch"], current if ok else "a detached HEAD or unknown (%s)" % (current or "git failed"),
+        state["branch"])
+
+
+def approve_plan(root, config, state):
+    """Validate run/steps.json again and store it as approvedSteps. Return the message for the user."""
+    plan_config = phase_graph(config, state).get(config["feature"].get("planPhase", "feature-plan"), {})
+    result, _, full = check_phase(root, config, plan_config)
+    if result != "pass":
+        return "The plan cannot be approved yet:\n%s\n\nFix it, then run %s again." % (full, cmd_name(config, "go"))
+    with open(os.path.join(root, plan_config["check"]["path"]), encoding="utf-8") as f:
+        state["approvedSteps"] = json.load(f)
+    # Until step execution exists, every later go repeats this approval instead of re-entering planning.
+    state.update(status="paused", awaitingApproval=True)
+    save_state(root, state)
+    return ("Plan approved: %d steps stored. Step execution is not available yet in this version of specloop, "
+            "so the run stays paused." % len(state["approvedSteps"]["steps"]))
+
+
+def await_approval(root, config, state):
+    """Pause after planning so the user can review the plan. Return the message for the user."""
+    state.update(status="paused", awaitingApproval=True)
+    save_state(root, state)
+    return ("The plan is ready. Review or edit %s and %s, then run %s to approve it." % (
+        _rel("run", "plan.md"), _rel("run", "steps.json"), cmd_name(config, "go")))
 
 
 # --- hook handlers ---------------------------------------------------------------
@@ -419,22 +555,28 @@ def handle_stop(root, hook_input):
         return None
     config = load_config(root)
     phase = state["phase"]
-    result, details, full = check_phase(root, config, phase)
+    graph = phase_graph(config, state)
+    result, details, full = check_phase(root, config, graph[phase])
     state["iter"] = state.get("iter", 0) + 1
     state.setdefault("history", []).append(
         {"phase": phase, "result": result, "at": now(), "iter": state["iter"]})
 
     if result == "pass":
         clear_failure(root)
-        next_phase = config["phases"][phase].get("next", DONE)
-        state["phase"] = next_phase
         state["lastFailure"] = None
+        if is_feature(state) and phase == config["feature"].get("planPhase"):
+            if config["feature"].get("requirePlanApproval", True):
+                return {"systemMessage": "[specloop] " + await_approval(root, config, state)}
+            return {"systemMessage": "[specloop] " + approve_plan(root, config, state)}
+        next_phase = graph[phase].get("next", DONE)
+        state["phase"] = next_phase
         if next_phase == DONE:
             state["status"] = "done"
             save_state(root, state)
             return {"systemMessage": "[specloop] all phases passed - done."}
         max_items = size_limit(config, "maxPlanItems")
-        if phase == "plan" and max_items is not None and not state.get("largePlanAcknowledged"):
+        if (phase == "plan" and not is_feature(state) and max_items is not None
+                and not state.get("largePlanAcknowledged")):
             items = count_plan_items(root)
             if items > max_items:
                 state["status"] = "paused"
@@ -453,8 +595,8 @@ def handle_stop(root, hook_input):
     write_failure(root, full)
     failure_file = _rel("run", FAILURE_FILE)
     if result == "reject":
-        archive_review(root, config, phase, state)
-        state["phase"] = config["phases"][phase]["check"].get("onReject", "implement")
+        archive_review(root, graph[phase], state)
+        state["phase"] = graph[phase]["check"].get("onReject", "implement")
         state["lastFailure"] = "review rejected"
         if is_delegated(config, state):
             reason = "Review requested changes. Back to phase '%s'. Full review: %s\n\n%s" % (
@@ -504,7 +646,7 @@ def handle_pretool(root, hook_input):
         protected = [_rel(n) for n in ("state.json", "config.json", "defaults.json", "engine.py")]
         if rel in protected:
             return deny("%s is managed by specloop; use the %s* commands." % (rel, cmd_name(config, "")))
-        allowed = config["phases"].get(phase, {}).get("allowEdits")
+        allowed = phase_graph(config, state).get(phase, {}).get("allowEdits")
         if allowed is not None and (rel is None or not any(rel.startswith(p) for p in allowed)):
             return deny("phase '%s' only allows editing %s, not %s." % (
                 phase, ", ".join(allowed), rel or "a path outside the project"))
@@ -542,7 +684,7 @@ def handle_context(root, event):
 
 # --- manual commands ---------------------------------------------------------------
 
-def cmd_init(root, spec):
+def cmd_init(root, spec, mode="single"):
     config = load_config(root)
     if not spec or not os.path.exists(os.path.join(root, spec)):
         return "Spec file not found: %r" % spec
@@ -550,8 +692,13 @@ def cmd_init(root, spec):
     if os.path.isdir(run_dir(root)):
         shutil.rmtree(run_dir(root))
     os.makedirs(run_dir(root))
-    save_state(root, {"status": "ready", "phase": config.get("initialPhase", "plan"),
-                      "spec": spec.replace("\\", "/"), "iter": 0, "history": [], "createdAt": now()})
+    feature = mode == "feature"
+    phase = config["feature"].get("planPhase", "feature-plan") if feature else config.get("initialPhase", "plan")
+    save_state(root, {"status": "ready", "mode": mode, "phase": phase, "spec": spec.replace("\\", "/"),
+                      "iter": 0, "history": [], "createdAt": now()})
+    if feature:
+        return "Spec loaded in feature mode: %s. Run %s to create the feature branch and start planning." % (
+            spec, cmd_name(config, "go"))
     out = "Spec loaded: %s. Run %s to start development." % (spec, cmd_name(config, "go"))
     warning = spec_size_warning(root, config, spec)
     return out + "\n\n" + warning if warning else out
@@ -565,7 +712,16 @@ def cmd_go(root):
     if state["status"] == "done":
         return "Workflow already done. Run %s and %s to start a new one." % (
             cmd_name(config, "reset"), cmd_name(config, "spec"))
-    if state["status"] == "ready" and not state.get("largeSpecAcknowledged"):
+    if is_feature(state):
+        if state.get("branch"):
+            error = check_feature_branch(root, config, state)
+        else:
+            error = start_feature_branch(root, config, state)
+        if error:
+            return "Not started: %s" % error
+        if state["status"] == "paused" and state.get("awaitingApproval"):
+            return approve_plan(root, config, state)
+    elif state["status"] == "ready" and not state.get("largeSpecAcknowledged"):
         warning = spec_size_warning(root, config, state.get("spec", ""))
         if warning and not state.get("largeSpecWarned"):
             state["largeSpecWarned"] = True
@@ -599,7 +755,9 @@ def cmd_advance(root):
     config = load_config(root)
     clear_failure(root)
     state.setdefault("history", []).append({"phase": state["phase"], "result": "skipped", "at": now()})
-    state["phase"] = config["phases"][state["phase"]].get("next", DONE)
+    if is_feature(state) and state["phase"] == config["feature"].get("planPhase"):
+        return await_approval(root, config, state)
+    state["phase"] = phase_graph(config, state)[state["phase"]].get("next", DONE)
     if state["phase"] == DONE:
         state["status"] = "done"
     save_state(root, state)
@@ -656,6 +814,7 @@ def main(argv):
     root = project_dir()
     handlers = {
         "init": lambda: cmd_init(root, " ".join(args).strip().strip('"')),
+        "init-feature": lambda: cmd_init(root, " ".join(args).strip().strip('"'), mode="feature"),
         "go": lambda: cmd_go(root),
         "pause": lambda: cmd_pause(root),
         "advance": lambda: cmd_advance(root),

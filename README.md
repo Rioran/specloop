@@ -86,6 +86,7 @@ An update replaces the engine, launcher, `defaults.json` and the shipped `phases
 | Command | What it does |
 |---------|--------------|
 | `/sl-spec <file>` | Load a spec; status `ready`. Clears the previous run's `run/` artifacts (plan, reviews). Claude summarizes the spec and waits. |
+| `/sl-feature <file>` | Load a spec in [feature mode](#feature-mode) (one commit per planned step). Also clears `run/`. |
 | `/sl-go` | Start, or resume after pause/stall. |
 | `/sl-pause` | Stop driving the session; keep the phase. |
 | `/sl-status` | Show the state (phase, iteration, history). |
@@ -181,6 +182,46 @@ Set a key to `null` to disable that check, or the whole block to disable all of 
 |----------|--------|
 | `SPECLOOP_DISABLED=1` | All hooks become no-ops. |
 | `SPECLOOP_PYTHON=/path/to/python` | Interpreter for the launcher and installer (skips auto-detection). |
+
+## Feature mode
+
+For features too big for one plan → implement → review cycle, load the spec with `/sl-feature` instead of `/sl-spec`. A planning subagent splits the spec into small ordered steps, and each step is meant to end in one commit on a dedicated branch.
+
+> **Status:** branch creation, planning and plan approval are available. Running and committing the steps is **coming soon**: approving a plan currently stores it and reports that step execution is not available yet.
+
+```
+/sl-feature specs/big-feature.md   load the spec in feature mode (Claude summarizes it)
+/sl-go                             create the feature branch, run the planning phase, pause for approval
+/sl-go                             approve the plan (re-validates run/steps.json)
+```
+
+**Branch.** The first `/sl-go` of a feature run creates and checks out `feature.branchPrefix` + a slug of the spec's first `# ` heading (or its file name): lowercase ASCII, `-` separators, at most 50 characters. If that branch exists, `-2`, `-3`, … is appended. It refuses, without changing anything, when the directory is not a git repository, the repository has no commits, `HEAD` is detached, or tracked files have uncommitted changes (staged or not; changes under `.claude/specloop/` are ignored). State records `branch`, `baseRef` (the starting commit) and `preexistingUntracked` (untracked files that existed at start). Later `/sl-go` calls refuse if the current branch is not the run's branch.
+
+**Planning.** The `feature-plan` phase is delegated to a subagent (see [Delegating a phase](#delegating-a-phase-to-a-subagent)). It writes `run/plan.md` (goal, acceptance criteria, assumptions, step-order rationale) and `run/steps.json`:
+
+```json
+{
+  "feature": "Short feature title",
+  "steps": [
+    { "id": 1, "title": "At most 72 characters", "type": "feat", "description": "What and why.",
+      "acceptance": ["Observable criterion"], "files": ["src/x.py"], "status": "pending", "commit": null }
+  ]
+}
+```
+
+Edits are restricted to `.claude/specloop/run/`. The gate passes when `steps.json` parses, matches the schema and every step is `pending`; otherwise the errors are written to `run/last-failure.md` and the subagent keeps working.
+
+**Approval.** When the plan passes its gate, the run pauses. Review or edit `run/plan.md` and `run/steps.json`, then run `/sl-go`: it validates `steps.json` again (refusing with the errors if it is invalid) and stores the approved copy in state as `approvedSteps`.
+
+The single-mode size warnings do not apply in feature mode.
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `feature.branchPrefix` | `"specloop/"` | Prefix of the feature branch name. |
+| `feature.planPhase` | `"feature-plan"` | First phase of a feature run. |
+| `feature.requirePlanApproval` | `true` | Pause for approval after planning. When `false`, the plan is approved as soon as its gate passes. |
+| `feature.gitTimeoutSec` | `60` | Timeout for every git call the engine makes. |
+| `feature.planPhases` | `feature-plan` phase | Phase graph for planning, with the same keys as `phases` (`delegate`, `allowEdits`, `check`, `instructions`). |
 
 ## Tips
 

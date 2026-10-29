@@ -1,0 +1,8 @@
+---
+description: "specloop: load a specification in feature mode (one commit per planned step)"
+argument-hint: <path-to-spec.md>
+allowed-tools: Bash(sh .claude/specloop/run.sh:*)
+---
+!`sh .claude/specloop/run.sh init-feature "$ARGUMENTS"`
+
+Read the specification file named above and summarize it in a few lines: goal, acceptance criteria, anything ambiguous. Do not plan or implement yet; development starts when the user runs /{{prefix}}go, which creates the feature branch and starts the planning phase.

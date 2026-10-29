@@ -1,6 +1,7 @@
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -799,6 +800,303 @@ class StepsValidationTest(unittest.TestCase):
         self.assertStepError(workflow.check_steps_immutable(self.history(), current), "steps[4] (id 9)", "status")
         new.update(status="pending", commit="abc999")
         self.assertStepError(workflow.check_steps_immutable(self.history(), current), "steps[4] (id 9)", "commit")
+
+
+def force_rmtree(path):
+    """Remove a tree, including git's read-only object files on Windows."""
+    def make_writable(func, target, _):
+        os.chmod(target, 0o700)
+        func(target)
+    if os.path.exists(path):
+        shutil.rmtree(path, onerror=make_writable)
+
+
+class FeatureModeTest(unittest.TestCase):
+
+    def setUp(self):
+        if not shutil.which("git"):
+            self.skipTest("git not available")
+        self.root = tempfile.mkdtemp()
+        self.ceiling = os.environ.get("GIT_CEILING_DIRECTORIES")
+        os.environ["GIT_CEILING_DIRECTORIES"] = os.path.dirname(self.root)
+        self.base = os.path.join(self.root, ".claude", "specloop")
+        shutil.copytree(KIT, self.base)
+        self.write("spec.md", "# My Big Feature!\n\nDo many things.\n")
+        self.git("init", "-q")
+        self.git("config", "user.name", "Test")
+        self.git("config", "user.email", "test@example.com")
+        self.git("config", "commit.gpgsign", "false")
+        self.git("add", "spec.md")
+        self.git("commit", "-q", "-m", "initial")
+        self.start_branch = self.git("symbolic-ref", "--short", "HEAD")
+
+    def tearDown(self):
+        if self.ceiling is None:
+            os.environ.pop("GIT_CEILING_DIRECTORIES", None)
+        else:
+            os.environ["GIT_CEILING_DIRECTORIES"] = self.ceiling
+        force_rmtree(self.root)
+
+    def git(self, *args):
+        proc = subprocess.run(["git"] + list(args), cwd=self.root, stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, check=True)
+        return proc.stdout.decode("utf-8").strip()
+
+    def write(self, rel, text):
+        path = os.path.join(self.root, rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+
+    def write_run(self, name, text):
+        self.write(os.path.join(".claude", "specloop", "run", name), text)
+
+    def set_config(self, config):
+        with open(os.path.join(self.base, "config.json"), "w") as f:
+            json.dump(config, f)
+
+    def state(self):
+        return workflow.load_state(self.root)
+
+    def state_bytes(self):
+        path = os.path.join(self.base, "state.json")
+        with open(path, "rb") as f:
+            return f.read()
+
+    def current_branch(self):
+        return self.git("symbolic-ref", "--short", "HEAD")
+
+    def last_failure(self):
+        with open(os.path.join(self.base, "run", "last-failure.md"), encoding="utf-8") as f:
+            return f.read()
+
+    def start(self):
+        workflow.cmd_init(self.root, "spec.md", mode="feature")
+        return workflow.cmd_go(self.root)
+
+    def pass_planning(self, data=None):
+        self.write_run("plan.md", "# Plan")
+        self.write_run("steps.json", json.dumps(data or valid_steps()))
+        return workflow.handle_stop(self.root, {})
+
+    def assertRefusedUnchanged(self, needle):
+        workflow.cmd_init(self.root, "spec.md", mode="feature")
+        before = self.state_bytes()
+        out = workflow.cmd_go(self.root)
+        self.assertIn(needle, out)
+        self.assertEqual(before, self.state_bytes())
+        if os.path.isdir(os.path.join(self.root, ".git")):
+            self.assertNotIn("specloop/", self.git("branch", "--list"))
+        return out
+
+    def test_init_feature_sets_mode_and_plan_phase(self):
+        self.write("spec.md", "# Big\n" + "line\n" * 300)
+        out = workflow.cmd_init(self.root, "spec.md", mode="feature")
+        self.assertNotIn("/sl-feature", out)
+        self.assertEqual("feature", self.state()["mode"])
+        self.assertEqual("feature-plan", self.state()["phase"])
+        self.assertEqual("ready", self.state()["status"])
+        workflow.cmd_init(self.root, "spec.md")
+        self.assertEqual("single", self.state()["mode"])
+
+    def test_init_feature_command_entry_point(self):
+        os.environ["CLAUDE_PROJECT_DIR"] = self.root
+        try:
+            self.assertEqual(0, workflow.main(["init-feature", "spec.md"]))
+        finally:
+            del os.environ["CLAUDE_PROJECT_DIR"]
+        self.assertEqual("feature", self.state()["mode"])
+
+    def test_go_creates_branch_records_base_and_enters_plan(self):
+        head = self.git("rev-parse", "HEAD")
+        out = self.start()
+        self.assertEqual("specloop/my-big-feature", self.current_branch())
+        state = self.state()
+        self.assertEqual("specloop/my-big-feature", state["branch"])
+        self.assertEqual(head, state["baseRef"])
+        self.assertEqual("active", state["status"])
+        self.assertEqual("feature-plan", state["phase"])
+        self.assertIn("exactly one subagent", out)
+        self.assertIn("steps.json", out)
+
+    def test_existing_branch_gets_numeric_suffix(self):
+        self.start()
+        self.git("checkout", "-q", self.start_branch)
+        self.start()
+        self.assertEqual("specloop/my-big-feature-2", self.current_branch())
+        self.git("checkout", "-q", self.start_branch)
+        self.start()
+        self.assertEqual("specloop/my-big-feature-3", self.state()["branch"])
+
+    def test_slug_from_heading_file_name_and_limits(self):
+        self.assertEqual("my-big-feature", workflow.branch_slug("# My Big Feature!\nx", "spec.md"))
+        self.assertEqual("add-login", workflow.branch_slug("no heading\n## Sub\n", "specs/Add_Login.md"))
+        self.assertEqual("cafe-deja-vu", workflow.branch_slug("# Café — déjà vu\n", "x.md"))
+        self.assertEqual("second", workflow.branch_slug("text\n#hashtag\n# Second\n# Third", "x.md"))
+        slug = workflow.branch_slug("# " + "word " * 20, "x.md")
+        self.assertLessEqual(len(slug), 50)
+        self.assertFalse(slug.endswith("-"))
+        self.assertEqual("feature", workflow.branch_slug("# !!!", "???.md"))
+
+    def test_go_refuses_outside_git_repo(self):
+        force_rmtree(os.path.join(self.root, ".git"))
+        self.assertIn("not a git repository", self.assertRefusedUnchanged("not a git repository"))
+
+    def test_go_refuses_on_detached_head(self):
+        self.git("checkout", "-q", "--detach")
+        self.assertRefusedUnchanged("detached")
+
+    def test_go_refuses_with_modified_tracked_file(self):
+        self.write("spec.md", "# My Big Feature!\nchanged\n")
+        self.assertIn("spec.md", self.assertRefusedUnchanged("uncommitted changes"))
+
+    def test_go_refuses_with_staged_new_file(self):
+        self.write("new.py", "x = 1\n")
+        self.git("add", "new.py")
+        self.assertIn("new.py", self.assertRefusedUnchanged("uncommitted changes"))
+
+    def test_changes_under_specloop_dir_do_not_block(self):
+        self.set_config({"commandPrefix": "sl-"})
+        self.git("add", ".claude/specloop/config.json")
+        self.git("commit", "-q", "-m", "config")
+        self.set_config({"commandPrefix": "sl-", "maxIterations": 9})
+        self.start()
+        self.assertEqual("active", self.state()["status"])
+
+    def test_preexisting_untracked_files_recorded(self):
+        self.write("notes.txt", "n")
+        self.write(os.path.join("dir", "a.txt"), "a")
+        self.start()
+        self.assertEqual(["dir/a.txt", "notes.txt"], self.state()["preexistingUntracked"])
+
+    def test_invalid_steps_blocks_stop_with_errors(self):
+        self.start()
+        data = valid_steps()
+        data["steps"][0]["title"] = ""
+        out = self.pass_planning(data)
+        self.assertEqual("block", out["decision"])
+        # feature-plan is delegated, so the reason stays short and the errors are in last-failure.md.
+        self.assertIn("steps.json is invalid", out["reason"])
+        self.assertIn(".claude/specloop/run/last-failure.md", out["reason"])
+        self.assertIn("steps[0] (id 1): title", self.last_failure())
+        self.assertEqual("feature-plan", self.state()["phase"])
+        self.assertEqual("active", self.state()["status"])
+
+    def test_steps_must_all_be_pending(self):
+        self.start()
+        data = valid_steps()
+        data["steps"][1]["status"] = "done"
+        self.assertEqual("block", self.pass_planning(data)["decision"])
+        self.assertIn("steps[1] (id 2): status must be pending", self.last_failure())
+
+    def test_invalid_steps_reason_lists_errors_when_not_delegated(self):
+        self.set_config({"feature": {"planPhases": {"feature-plan": {"delegate": False}}}})
+        self.start()
+        data = valid_steps()
+        data["steps"][0]["title"] = ""
+        self.assertIn("steps[0] (id 1): title", self.pass_planning(data)["reason"])
+
+    def test_valid_steps_pause_for_approval_then_go_stores_approved_steps(self):
+        self.start()
+        out = self.pass_planning()
+        self.assertNotIn("decision", out)
+        for needle in ("plan.md", "steps.json", "/sl-go"):
+            self.assertIn(needle, out["systemMessage"])
+        self.assertEqual("paused", self.state()["status"])
+        self.assertTrue(self.state()["awaitingApproval"])
+        self.assertIsNone(workflow.handle_stop(self.root, {}))
+
+        broken = valid_steps()
+        broken["steps"][0]["acceptance"] = []
+        self.write_run("steps.json", json.dumps(broken))
+        out = workflow.cmd_go(self.root)
+        self.assertIn("steps[0] (id 1): acceptance", out)
+        self.assertNotIn("approvedSteps", self.state())
+        self.assertEqual("paused", self.state()["status"])
+
+        edited = valid_steps()
+        edited["steps"][0]["title"] = "Edited by the user"
+        self.write_run("steps.json", json.dumps(edited))
+        out = workflow.cmd_go(self.root)
+        self.assertIn("not available yet", out)
+        self.assertEqual(edited, self.state()["approvedSteps"])
+        self.assertEqual("paused", self.state()["status"])
+
+    def test_go_refuses_approval_when_steps_file_missing(self):
+        self.start()
+        self.pass_planning()
+        os.remove(os.path.join(self.base, "run", "steps.json"))
+        self.assertIn("missing", workflow.cmd_go(self.root))
+        self.assertNotIn("approvedSteps", self.state())
+
+    def test_require_plan_approval_false_stores_steps_without_pause_prompt(self):
+        self.set_config({"feature": {"requirePlanApproval": False}})
+        self.start()
+        out = self.pass_planning()
+        self.assertIn("not available yet", out["systemMessage"])
+        self.assertEqual(valid_steps(), self.state()["approvedSteps"])
+        self.assertEqual("paused", self.state()["status"])
+        out = workflow.cmd_go(self.root)
+        self.assertIn("not available yet", out)
+        self.assertNotIn("## Phase: feature-plan", out)
+        self.assertEqual("paused", self.state()["status"])
+        self.assertIsNone(workflow.handle_stop(self.root, {}))
+
+    def test_null_feature_config_does_not_break_loading(self):
+        self.set_config({"feature": None})
+        config = workflow.load_config(self.root)
+        self.assertEqual({}, config["feature"]["planPhases"])
+        workflow.cmd_init(self.root, "spec.md")
+        self.assertEqual("plan", self.state()["phase"])
+
+    def test_advance_in_plan_phase_enters_approval(self):
+        self.start()
+        self.write_run("steps.json", json.dumps(valid_steps()))
+        workflow.cmd_advance(self.root)
+        self.assertTrue(self.state()["awaitingApproval"])
+        self.assertEqual("paused", self.state()["status"])
+        self.assertEqual("feature-plan", self.state()["phase"])
+
+    def test_resume_on_other_branch_is_refused(self):
+        self.start()
+        workflow.cmd_pause(self.root)
+        self.git("checkout", "-q", self.start_branch)
+        before = self.state_bytes()
+        out = workflow.cmd_go(self.root)
+        self.assertIn("specloop/my-big-feature", out)
+        self.assertIn(self.start_branch, out)
+        self.assertEqual(before, self.state_bytes())
+        self.git("checkout", "-q", "specloop/my-big-feature")
+        workflow.cmd_go(self.root)
+        self.assertEqual("active", self.state()["status"])
+
+    def test_feature_plan_edits_restricted_to_run_dir(self):
+        self.start()
+        src = os.path.join(self.root, "src", "x.py")
+        out = workflow.handle_pretool(self.root, {"tool_name": "Edit", "tool_input": {"file_path": src}})
+        self.assertEqual("deny", out["hookSpecificOutput"]["permissionDecision"])
+        steps = os.path.join(self.base, "run", "steps.json")
+        self.assertIsNone(workflow.handle_pretool(self.root, {"tool_name": "Write", "tool_input": {"file_path": steps}}))
+
+    def test_context_and_delegation_in_feature_plan(self):
+        self.start()
+        workflow.handle_stop(self.root, {})
+        text = workflow.handle_context(self.root, "UserPromptSubmit")["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("Phase 'feature-plan' is delegated", text)
+
+    def test_git_errors_never_raise(self):
+        workflow.cmd_init(self.root, "spec.md", mode="feature")
+        path = os.environ.get("PATH", "")
+        os.environ["PATH"] = ""
+        try:
+            out = workflow.cmd_go(self.root)
+        finally:
+            os.environ["PATH"] = path
+        self.assertIn("git", out)
+        self.assertEqual("ready", self.state()["status"])
+        ok, output = workflow.git(self.root, {"feature": {"gitTimeoutSec": 30}}, "rev-parse", "HEAD")
+        self.assertTrue(ok)
+        self.assertEqual(self.git("rev-parse", "HEAD"), output)
 
 
 if __name__ == "__main__":
