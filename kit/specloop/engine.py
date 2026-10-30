@@ -47,6 +47,7 @@ VERDICT_PREFIX = re.compile(r"^(?:\s|>|#+(?=\s)|[-+*](?=\s))+")  # Markdown quot
 VERDICT_WRAP = " \t`*_."  # whitespace, emphasis and a trailing period around a verdict
 CODE_FENCE = re.compile(r"(?:[ \t>]|[-+*](?=[ \t])|[0-9]{1,9}[.)](?=[ \t]))*(`{3,}|~{3,})(.*)$")  # opener: run, info
 FENCE_CLOSE = re.compile(r"[ \t>]*(`{3,}|~{3,})[ \t]*$")  # closer: a bare run, never behind a list marker
+LINE_BREAK = re.compile(r"\r\n|\r|\n")
 
 
 def project_dir(hook_input=None):
@@ -407,17 +408,18 @@ def code_fence(line):
 
 
 def find_verdict(text, check):
-    """Return 'pass', 'reject' or None from the verdict lines of a review.
+    """Return 'pass', 'reject', 'unclosed' or None from the verdict lines of a review.
 
     A verdict line is a whole line whose bare text (see verdict_line) equals check["approve"] or the
     optional check["reject"]; lines inside fenced code blocks are skipped. So a marker quoted inside a
     sentence or a code block never counts. The last verdict line wins, so a reviewer who changes their
-    mind is read correctly."""
+    mind is read correctly. A fence still open at the end hides the rest of the file: 'unclosed'."""
     approve, reject, bare = verdict_line(check["approve"]), verdict_line(check.get("reject") or ""), verdict_line
-    if not approve or approve == reject:  # markers that are nothing but decoration: compare them as written
+    if not approve or approve == reject or (check.get("reject") and not reject):
+        # Markers that are nothing but decoration: compare them as written.
         approve, reject, bare = check["approve"].strip(), (check.get("reject") or "").strip(), str.strip
     verdict, fence = None, ""
-    for line in text.splitlines():
+    for line in LINE_BREAK.split(text):  # not str.splitlines: Markdown breaks lines only on \n and \r
         if fence:  # only a bare run of the same character, at least as long, closes the block
             close = FENCE_CLOSE.match(line)
             if close and close.group(1)[0] == fence[0] and len(close.group(1)) >= len(fence):
@@ -431,7 +433,7 @@ def find_verdict(text, check):
             verdict = "pass"
         elif reject and line == reject:
             verdict = "reject"
-    return None if fence else verdict  # an unclosed fence hid the rest of the file: never trust an earlier verdict
+    return "unclosed" if fence else verdict
 
 
 def check_phase(root, config, phase_config):
@@ -473,6 +475,9 @@ def check_phase(root, config, phase_config):
             return "pass", "review approved", ""
         if verdict == "reject":
             return "reject", tail(text, limit), text
+        if verdict == "unclosed":
+            return _same("fail", "%s has a fenced code block that is never closed, so no verdict line counts. "
+                         "Close it (a snippet that contains ``` goes inside a ```` fence)." % check["path"])
         markers = " or ".join("'%s'" % m for m in (check["approve"], check.get("reject")) if m)
         return _same("fail", "%s must contain a verdict line: exactly %s on a line of its own." % (
             check["path"], markers))

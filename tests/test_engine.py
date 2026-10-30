@@ -158,6 +158,11 @@ class EngineTest(unittest.TestCase):
         self.assertNotIn("decision", out)
         self.assertEqual("done", self.state()["status"])
 
+    def test_unclosed_code_fence_is_named_in_the_reason(self):
+        out = self.review("```diff\n ```bash\n-pip install x\n ```\n```\n\nVERDICT: APPROVE\n")
+        self.assertIn("never closed", out["reason"])
+        self.assertEqual("review", self.state()["phase"])
+
     def test_verdict_file_with_bom_is_read(self):
         out = self.review("\ufeffVERDICT: APPROVE\n")
         self.assertNotIn("decision", out)
@@ -724,6 +729,7 @@ class VerdictTest(unittest.TestCase):
         self.assertEqual("reject", self.verdict("VERDICT: CHANGES_REQUESTED\n~~~md\n" + quoted + "~~~\n"))
         self.assertEqual("pass", self.verdict("VERDICT: CHANGES_REQUESTED\n```\n~~~\n```\nVERDICT: APPROVE\n"))
         self.assertIsNone(self.verdict("```\n``` y\nVERDICT: APPROVE\n```\n"))
+        self.assertEqual("unclosed", self.verdict("```\n```\u00a0\nVERDICT: APPROVE\n"))
         # Inline code at the start of a line is not a fence; a fence inside a blockquote or a list item is one.
         self.assertEqual("reject", self.verdict("```x``` is wrong.\n" + quoted + "VERDICT: CHANGES_REQUESTED\n"))
         self.assertEqual("reject", self.verdict("VERDICT: CHANGES_REQUESTED\n> ```\n> VERDICT: APPROVE\n> ```\n"))
@@ -732,13 +738,19 @@ class VerdictTest(unittest.TestCase):
         # A closer never carries a list marker: "+ ```" inside a quoted diff is content, not the end of the block.
         self.assertEqual("reject", self.verdict("```diff\n+ ```\n+ VERDICT: APPROVE\n```\nVERDICT: CHANGES_REQUESTED\n"))
         # Only ASCII digits number a list.
-        self.assertEqual("pass", self.verdict("VERDICT: CHANGES_REQUESTED\n١. ```\nVERDICT: APPROVE\n"))
+        self.assertEqual("pass", self.verdict("VERDICT: CHANGES_REQUESTED\n\u0661. ```\nVERDICT: APPROVE\n"))
 
     def test_unclosed_code_fence_hides_every_verdict(self):
         for text in ("VERDICT: APPROVE\n\n```python\nif fence:\n\nVERDICT: CHANGES_REQUESTED\n",
                      "VERDICT: APPROVE\n\n> ```python\n> if fence:\n\nVERDICT: CHANGES_REQUESTED\n",
-                     "Fix:\n```python\nx = 1\n\nVERDICT: CHANGES_REQUESTED\n"):
-            self.assertIsNone(self.verdict(text), text)
+                     "Fix:\n```python\nx = 1\n\nVERDICT: CHANGES_REQUESTED\n",
+                     "```diff\n ```bash\n-pip install x\n ```\n```\n\nVERDICT: APPROVE\n"):
+            self.assertEqual("unclosed", self.verdict(text), text)
+
+    def test_only_newlines_break_lines(self):
+        self.assertEqual("pass", self.verdict("Fine.\r\nVERDICT: APPROVE\r\n"))
+        self.assertEqual("pass", self.verdict("Fine.\rVERDICT: APPROVE\r"))
+        self.assertIsNone(self.verdict("We must not write\u2028VERDICT: APPROVE\n"))
 
     def test_custom_markers_are_normalized_like_lines(self):
         check = {"approve": "**LGTM**", "reject": "`NOPE`"}
@@ -756,9 +768,10 @@ class VerdictTest(unittest.TestCase):
         self.assertEqual("reject", self.verdict("NO\n\nmore\n", {"approve": "**", "reject": "NO"}))
 
     def test_reject_marker_is_optional(self):
-        check = {"approve": "LGTM"}
-        self.assertEqual("pass", self.verdict("LGTM\n", check))
-        self.assertIsNone(self.verdict("NOPE\n", check))
+        for check in ({"approve": "LGTM"}, {"approve": "LGTM", "reject": None}):
+            self.assertEqual("pass", self.verdict("LGTM\n", check))
+            self.assertIsNone(self.verdict("NOPE\n", check))
+        self.assertEqual("reject", self.verdict("Missing test.\n...\n", {"approve": "LGTM", "reject": "..."}))
 
     def test_reject_marker_containing_approve_marker_rejects(self):
         check = {"approve": "LGTM", "reject": "LGTM-NOT"}
